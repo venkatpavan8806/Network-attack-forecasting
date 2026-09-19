@@ -1,12 +1,21 @@
 """LSTM world model: learns P(S_{t+1} | S_t, S_{t-1}, ..., S_{t-L+1}).
 
-Two heads share an attention-pooled LSTM encoding:
+Two heads share a CNN -> Bi-LSTM -> attention-pooled encoding:
   - next_stage_head: classifies the next window's state_label (7 classes,
     including the derived "ambiguous_pre_attack" class)
   - next_state_head: regresses the next window's normalized feature vector,
     which is what makes K-step rollout possible -- the predicted vector is
     fed back in as if it were observed, so the model genuinely predicts its
     own future inputs rather than only ever seeing real history.
+
+Encoder: a small 1D-CNN pass over each timestep's engineered feature vector
+(finds local combinations among related features) feeds a bidirectional
+LSTM (reads the seed window in both directions before pooling), then an
+additive attention pools across time -- this satisfies the project's
+CNN-hybrid + Bi-LSTM + attention requirement together. forward() still
+returns (stage_logits, next_state, attn_weights) with unchanged shapes, so
+rollout(), one_step_forecast(), and input_gradient_saliency() all work
+exactly as before.
 
 Explainability: a Bahdanau-style additive attention over the L past
 timesteps is used to pool the LSTM's hidden states, and the resulting
@@ -35,30 +44,65 @@ BENIGN_IDX = STAGE_TO_IDX["benign"]
 AMBIGUOUS_IDX = STAGE_TO_IDX["ambiguous_pre_attack"]
 
 
+class _FeatureCNNBlock(nn.Module):
+    """Per-timestep 1D conv across the feature axis -- treats the n_features
+    engineered values at one timestep as a short 1D signal and looks for
+    local combinations of related features, before the sequence model sees
+    it. Input (batch, seq_len, n_features) -> output (batch, seq_len, C)."""
+
+    def __init__(self, n_features: int, channels=(16, 32), dropout: float = 0.1):
+        super().__init__()
+        layers, in_ch = [], 1
+        for out_ch in channels:
+            layers += [
+                nn.Conv1d(in_ch, out_ch, kernel_size=3, padding=1),
+                nn.BatchNorm1d(out_ch),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            ]
+            in_ch = out_ch
+        self.conv = nn.Sequential(*layers)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.out_dim = channels[-1]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, seq_len, n_features = x.shape
+        x = x.reshape(batch * seq_len, 1, n_features)
+        x = self.conv(x)
+        x = self.pool(x).squeeze(-1)
+        return x.reshape(batch, seq_len, self.out_dim)
+
+
 class LSTMWorldModel(nn.Module):
     def __init__(self, n_features: int = N_FEATURES, hidden_size: int = 64, num_layers: int = 1,
-                 n_classes: int = N_CLASSES, dropout: float = 0.1):
+                 n_classes: int = N_CLASSES, dropout: float = 0.1, cnn_channels=(16, 32)):
         super().__init__()
         self.hidden_size = hidden_size
-        self.lstm = nn.LSTM(n_features, hidden_size, num_layers=num_layers, batch_first=True,
-                             dropout=dropout if num_layers > 1 else 0.0)
-        # additive attention over timesteps
-        self.attn_w = nn.Linear(hidden_size, hidden_size)
-        self.attn_v = nn.Linear(hidden_size, 1, bias=False)
+        self.cnn_channels = tuple(cnn_channels)
+
+        self.cnn = _FeatureCNNBlock(n_features, self.cnn_channels, dropout)
+        self.lstm = nn.LSTM(self.cnn.out_dim, hidden_size, num_layers=num_layers, batch_first=True,
+                             bidirectional=True, dropout=dropout if num_layers > 1 else 0.0)
+        encoder_dim = hidden_size * 2  # bidirectional doubles it
+
+        # additive attention over timesteps (same mechanism as before, dims adjusted for bidirectional)
+        self.attn_w = nn.Linear(encoder_dim, encoder_dim)
+        self.attn_v = nn.Linear(encoder_dim, 1, bias=False)
 
         self.dropout = nn.Dropout(dropout)
-        self.stage_head = nn.Linear(hidden_size, n_classes)
-        self.state_head = nn.Linear(hidden_size, n_features)
+        self.stage_head = nn.Linear(encoder_dim, n_classes)
+        self.state_head = nn.Linear(encoder_dim, n_features)
 
     def forward(self, x: torch.Tensor):
         """x: (batch, seq_len, n_features)
         returns stage_logits (batch, n_classes), next_state (batch, n_features),
         attn_weights (batch, seq_len)
         """
-        h_seq, _ = self.lstm(x)  # (batch, seq_len, hidden)
+        x = self.cnn(x)              # (batch, seq_len, cnn_out_dim)
+        h_seq, _ = self.lstm(x)      # (batch, seq_len, hidden*2)
         scores = self.attn_v(torch.tanh(self.attn_w(h_seq))).squeeze(-1)  # (batch, seq_len)
         attn_weights = F.softmax(scores, dim=1)  # (batch, seq_len)
-        context = torch.bmm(attn_weights.unsqueeze(1), h_seq).squeeze(1)  # (batch, hidden)
+        context = torch.bmm(attn_weights.unsqueeze(1), h_seq).squeeze(1)  # (batch, hidden*2)
         context = self.dropout(context)
         stage_logits = self.stage_head(context)
         next_state = self.state_head(context)
@@ -85,6 +129,7 @@ def save_model(model: LSTMWorldModel, hidden_size: int, num_layers: int):
             "n_classes": N_CLASSES,
             "seq_len": SEQ_LEN,
             "stage_classes": STAGE_CLASSES,
+            "cnn_channels": list(model.cnn_channels),
         }, f, indent=2)
 
 
@@ -92,7 +137,8 @@ def load_model() -> LSTMWorldModel:
     with open(LSTM_META) as f:
         meta = json.load(f)
     model = LSTMWorldModel(n_features=meta["n_features"], hidden_size=meta["hidden_size"],
-                            num_layers=meta["num_layers"], n_classes=meta["n_classes"])
+                            num_layers=meta["num_layers"], n_classes=meta["n_classes"],
+                            cnn_channels=meta.get("cnn_channels", (16, 32)))
     model.load_state_dict(torch.load(LSTM_WEIGHTS, map_location="cpu", weights_only=True))
     model.eval()
     return model
