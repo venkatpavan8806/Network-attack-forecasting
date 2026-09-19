@@ -11,6 +11,7 @@ autoregressive, to every subsequently predicted window as well (the
 mitigation is treated as staying active for the whole forecast horizon).
 Each predicted next-state is produced by the model in normalized space,
 inverse-transformed back to raw feature space via the fitted scaler,
+boundary-clamped to valid physical domains (non-negative counts, valid ratios),
 mutated by the mitigation, and re-transformed before being fed back in --
 this is an exact round-trip through the same scaler used at training time.
 
@@ -25,8 +26,40 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from app.config import ROLLOUT_K, IDX_TO_ACTION
+from app.config import ROLLOUT_K, IDX_TO_ACTION, FEATURE_COLUMNS
 from app.models.lstm_world_model import infiltration_probability
+
+_IDX = {name: i for i, name in enumerate(FEATURE_COLUMNS)}
+
+
+def _clamp_physical_bounds(row: np.ndarray) -> np.ndarray:
+    """Clamps regressed raw feature values to realistic physical boundaries
+    to prevent numerical drift during autoregressive rollout."""
+    row = row.copy()
+    # counts and byte totals must be non-negative
+    for col in [
+        "flow_count", "unique_dst_ports", "unique_dst_ips",
+        "syn_count", "ack_count", "fin_count", "rst_count", "psh_count",
+        "inbound_bytes", "outbound_bytes", "avg_bytes_per_flow", "std_bytes_per_flow",
+        "avg_pkts_per_flow", "avg_flow_duration", "std_flow_duration",
+        "iat_mean", "iat_std", "ttl_mean", "ttl_std",
+        "win_size_mean", "win_size_std", "pkt_len_mean", "pkt_len_std",
+    ]:
+        if col in _IDX:
+            row[_IDX[col]] = max(0.0, float(row[_IDX[col]]))
+
+    # ratios and indicators must stay within [0, 1]
+    for col in [
+        "failed_conn_ratio", "new_dst_ip_ratio", "port_scan_score",
+        "dst_port_is_22", "dst_port_is_445", "dst_port_is_3389", "dst_port_is_443",
+    ]:
+        if col in _IDX:
+            row[_IDX[col]] = float(np.clip(row[_IDX[col]], 0.0, 1.0))
+
+    if "bytes_ratio_out_in" in _IDX:
+        row[_IDX["bytes_ratio_out_in"]] = max(0.0, float(row[_IDX["bytes_ratio_out_in"]]))
+
+    return row
 
 
 @torch.no_grad()
@@ -69,4 +102,33 @@ def compare_with_and_without(model, scaler, seed_raw: np.ndarray, mitigation_fn,
     seed_scaled = scaler.transform(seed_raw).astype(np.float32)
     baseline = rollout(model, seed_scaled, k=k)
     mitigated = rollout_counterfactual(model, scaler, seed_raw, mitigation_fn, k=k)
-    return baseline, mitigated
+
+    # Compute comparative quantitative metrics
+    mean_without = float(np.mean(baseline["infiltration_probs"]))
+    mean_with = float(np.mean(mitigated["infiltration_probs"]))
+    peak_without = float(np.max(baseline["infiltration_probs"]))
+    peak_with = float(np.max(mitigated["infiltration_probs"]))
+
+    if mean_without > 0.01:
+        risk_reduction_pct = round(max(0.0, (mean_without - mean_with) / mean_without * 100.0), 1)
+    else:
+        risk_reduction_pct = 0.0
+
+    if risk_reduction_pct >= 60.0:
+        verdict = "High Efficacy (Attack Successfully Averted)"
+    elif risk_reduction_pct >= 25.0:
+        verdict = "Moderate Efficacy (Attack Trajectory Slowed)"
+    elif risk_reduction_pct > 5.0:
+        verdict = "Low Efficacy (Marginal Risk Change)"
+    else:
+        verdict = "Neutral (No Observable Divergence)"
+
+    return baseline, mitigated, {
+        "mean_without": round(mean_without, 4),
+        "mean_with": round(mean_with, 4),
+        "peak_risk_without": round(peak_without, 4),
+        "peak_risk_with": round(peak_with, 4),
+        "risk_reduction_pct": risk_reduction_pct,
+        "verdict": verdict,
+    }
+
