@@ -147,6 +147,8 @@ export interface HostTimelineEntry {
 export interface MitigationInfo {
   id: string;
   label: string;
+  category?: string;
+  target_stage?: string;
   description: string;
 }
 
@@ -171,6 +173,8 @@ export interface CounterfactualResponse {
   action_divergences: ActionDivergence[];
   true_stage: string | null;
   state_label: string | null;
+  risk_reduction_pct?: number;
+  verdict?: string;
 }
 
 export interface LiveInterface {
