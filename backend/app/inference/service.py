@@ -176,16 +176,27 @@ class InferenceService:
         host_df = self.labeled_df[self.labeled_df["host_id"] == host_id].sort_values("window_idx").reset_index(drop=True)
         if len(host_df) == 0:
             raise ValueError(f"unknown host_id: {host_id}")
-        if at_window_idx is not None:
-            host_df = host_df[host_df["window_idx"] <= at_window_idx].reset_index(drop=True)
+
+        # If at_window_idx is not provided, intelligently pick the active attack onset window
+        # so the digital twin demonstrates intervention at the critical moment
+        if at_window_idx is None:
+            non_benign = host_df[host_df["true_stage"] != "benign"]
+            if len(non_benign) > 0:
+                at_window_idx = int(non_benign.iloc[0]["window_idx"])
+            else:
+                at_window_idx = int(host_df.iloc[-1]["window_idx"])
+
+        host_df = host_df[host_df["window_idx"] <= at_window_idx].reset_index(drop=True)
         if len(host_df) < SEQ_LEN:
-            raise ValueError(f"host '{host_id}' needs at least {SEQ_LEN} windows, has {len(host_df)}")
+            raise ValueError(f"host '{host_id}' needs at least {SEQ_LEN} windows up to window #{at_window_idx}, has {len(host_df)}")
 
         mitigation_fn = get_mitigation_fn(mitigation_id)
         end_pos = len(host_df) - 1
         seed_raw = host_df[FEATURE_COLUMNS].values[end_pos - SEQ_LEN + 1: end_pos + 1].astype(np.float32)
 
-        baseline_roll, mitigated_roll = compare_with_and_without(self.model, self.scaler, seed_raw, mitigation_fn, k=ROLLOUT_K)
+        baseline_roll, mitigated_roll, metrics = compare_with_and_without(
+            self.model, self.scaler, seed_raw, mitigation_fn, k=ROLLOUT_K
+        )
 
         last_row = host_df.iloc[end_pos]
         mitigations_meta = {m["id"]: m for m in list_mitigations()}
@@ -202,7 +213,7 @@ class InferenceService:
         return {
             "host_id": host_id,
             "window_idx": int(last_row["window_idx"]),
-            "mitigation": mitigations_meta[mitigation_id],
+            "mitigation": mitigations_meta.get(mitigation_id, {"id": mitigation_id, "label": mitigation_id, "description": ""}),
             "horizon_windows": ROLLOUT_K,
             "without_mitigation": {
                 "infiltration_probs": [round(p, 4) for p in baseline_roll["infiltration_probs"]],
@@ -215,6 +226,9 @@ class InferenceService:
             "action_divergences": divergences,
             "true_stage": last_row.get("true_stage"),
             "state_label": last_row.get("state_label"),
+            "metrics": metrics,
+            "risk_reduction_pct": metrics["risk_reduction_pct"],
+            "verdict": metrics["verdict"],
         }
 
     def available_mitigations(self):
