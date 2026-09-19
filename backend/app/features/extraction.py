@@ -1,0 +1,112 @@
+"""Feature matrix construction, normalization, and host-level train/val/test
+splitting. Splits are done by HOST (never by row) since rows within a host
+are a time series -- splitting by row would leak adjacent-window information
+across train/test.
+"""
+from __future__ import annotations
+
+import json
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+import joblib
+
+from app.config import FEATURE_COLUMNS, SEQ_LEN, STAGE_TO_IDX, RANDOM_SEED, SCALER_WEIGHTS
+
+
+def host_split(labeled_df: pd.DataFrame, seed: int = RANDOM_SEED):
+    """Splits hosts into train/val/test. The evasive attack host is pinned
+    to the test split deliberately, so the reported benchmark demonstrates
+    generalization to the slow/evasive recon pattern rather than only to
+    fast/obvious attacks seen in training."""
+    hosts = labeled_df["host_id"].unique().tolist()
+    benign_hosts = sorted(h for h in hosts if h.startswith("benign-host"))
+    attack_hosts = sorted(h for h in hosts if h.startswith("attack-host"))
+
+    rng = np.random.default_rng(seed)
+    rng.shuffle(benign_hosts)
+
+    n_benign = len(benign_hosts)
+    n_val_b = max(1, int(n_benign * 0.15))
+    n_test_b = max(1, int(n_benign * 0.15))
+    val_benign = benign_hosts[:n_val_b]
+    test_benign = benign_hosts[n_val_b:n_val_b + n_test_b]
+    train_benign = benign_hosts[n_val_b + n_test_b:]
+
+    # attack-host-000 is the evasive host (see generator.py) -- force it to test.
+    evasive_host = "attack-host-000"
+    remaining_attack = [h for h in attack_hosts if h != evasive_host]
+    rng.shuffle(remaining_attack)
+    # keep at least one attack host in train (if any remain) so the baseline
+    # always sees both classes during training, even on tiny datasets.
+    n_val_a = max(1, int(len(remaining_attack) * 0.2)) if len(remaining_attack) > 1 else 0
+    val_attack = remaining_attack[:n_val_a]
+    train_attack = remaining_attack[n_val_a:]
+    test_attack = [evasive_host]
+
+    train_hosts = set(train_benign + train_attack)
+    val_hosts = set(val_benign + val_attack)
+    test_hosts = set(test_benign + test_attack)
+    return train_hosts, val_hosts, test_hosts
+
+
+def fit_scaler(labeled_df: pd.DataFrame, train_hosts: set) -> StandardScaler:
+    train_df = labeled_df[labeled_df["host_id"].isin(train_hosts)]
+    scaler = StandardScaler()
+    scaler.fit(train_df[FEATURE_COLUMNS].values)
+    return scaler
+
+
+def save_scaler(scaler: StandardScaler, path=SCALER_WEIGHTS):
+    joblib.dump(scaler, path)
+
+
+def load_scaler(path=SCALER_WEIGHTS) -> StandardScaler:
+    return joblib.load(path)
+
+
+def build_sequences(labeled_df: pd.DataFrame, scaler: StandardScaler, hosts: set, seq_len: int = SEQ_LEN):
+    """For each host restricted to `hosts`, builds sliding-window sequences:
+      X: (n_samples, seq_len, n_features)          -- normalized S_{t-seq_len+1..t}
+      y_stage: (n_samples,)                         -- class idx of state_label at t+1
+      y_next_state: (n_samples, n_features)         -- normalized S_{t+1} (regression target)
+      y_cur_stage: (n_samples,)                     -- class idx of state_label at t (for reference/eval)
+      meta: list of dicts (host_id, window_idx of t, window_idx of t+1)
+    """
+    X_list, y_stage_list, y_next_list, y_cur_list, meta = [], [], [], [], []
+    for host_id, host_df in labeled_df[labeled_df["host_id"].isin(hosts)].groupby("host_id", sort=False):
+        host_df = host_df.sort_values("window_idx").reset_index(drop=True)
+        feats = scaler.transform(host_df[FEATURE_COLUMNS].values)
+        labels = host_df["state_label"].map(STAGE_TO_IDX).values
+        n = len(host_df)
+        for t in range(seq_len - 1, n - 1):
+            X_list.append(feats[t - seq_len + 1:t + 1])
+            y_stage_list.append(labels[t + 1])
+            y_next_list.append(feats[t + 1])
+            y_cur_list.append(labels[t])
+            meta.append({
+                "host_id": host_id,
+                "window_idx_t": int(host_df.loc[t, "window_idx"]),
+                "window_idx_next": int(host_df.loc[t + 1, "window_idx"]),
+            })
+    return (
+        np.array(X_list, dtype=np.float32),
+        np.array(y_stage_list, dtype=np.int64),
+        np.array(y_next_list, dtype=np.float32),
+        np.array(y_cur_list, dtype=np.int64),
+        meta,
+    )
+
+
+def build_single_window_table(labeled_df: pd.DataFrame, scaler: StandardScaler, hosts: set):
+    """For the baseline: single-window features -> current-window binary
+    malicious label (no history, no future). Returns X (n, n_features),
+    y_binary (n,), state_label (n,) strings, meta list."""
+    from app.config import MALICIOUS_HARD_STAGES
+
+    sub = labeled_df[labeled_df["host_id"].isin(hosts)].sort_values(["host_id", "window_idx"]).reset_index(drop=True)
+    X = scaler.transform(sub[FEATURE_COLUMNS].values).astype(np.float32)
+    y_binary = sub["true_stage"].isin(MALICIOUS_HARD_STAGES).astype(np.int64).values
+    meta = sub[["host_id", "window_idx", "true_stage", "state_label"]].to_dict("records")
+    return X, y_binary, meta
