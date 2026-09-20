@@ -14,6 +14,8 @@ Produces (all real, computed from this run -- see config.py for exact paths):
   data/lead_time_report.json       median lead-time vs baseline
   data/false_alarm_examples.json   real false-alarm examples from test hosts
   data/recent_forecast_log.json    sample of real inference rows for the UI table
+  data/stage_mean_vectors.json     per-action mean feature vector (train hosts only),
+                                    used by branching_rollout() to diverge sibling branches
 """
 from __future__ import annotations
 
@@ -30,6 +32,7 @@ from torch.utils.data import TensorDataset, DataLoader
 from app.config import (
     RANDOM_SEED, SYNTHETIC_CSV, DATA_DIR, SEQ_LEN, N_FEATURES, STAGE_CLASSES,
     STAGE_TO_IDX, IDX_TO_STAGE, MALICIOUS_HARD_STAGES, FORECAST_LOG_JSON,
+    FEATURE_COLUMNS, STAGE_MEAN_VECTORS_JSON,
 )
 from app.data_gen.generator import generate_dataset
 from app.labeling.state_labeler import derive_state_labels, build_transition_pairs
@@ -148,6 +151,30 @@ def build_recent_forecast_log(lstm_model, baseline_clf, scaler, labeled_df, test
     return sample
 
 
+def build_stage_mean_vectors(labeled_df, scaler, train_hosts) -> dict:
+    """Per-action mean NORMALIZED feature vector, computed on train hosts
+    only (same host-level split the scaler itself is fit on -- no test/val
+    leakage). Used only by branching_rollout() at inference time to make
+    sibling branches of the attack-forecast tree diverge plausibly; it is
+    a descriptive prototype, not a learned parameter, and plays no part in
+    training or in any reported benchmark/calibration/lead-time metric. A
+    class with zero rows among train hosts (possible on a tiny/unlucky
+    split) falls back to its mean over the FULL dataset so branching_rollout
+    always has a vector for every stage the model can predict."""
+    train_df = labeled_df[labeled_df["host_id"].isin(train_hosts)]
+    vectors = {}
+    for stage in STAGE_CLASSES:
+        rows = train_df[train_df["state_label"] == stage]
+        if len(rows) == 0:
+            rows = labeled_df[labeled_df["state_label"] == stage]
+        if len(rows) == 0:
+            continue  # stage never occurs in this run's data at all
+        vectors[stage] = scaler.transform(rows[FEATURE_COLUMNS].values).astype(np.float32).mean(axis=0).tolist()
+    with open(STAGE_MEAN_VECTORS_JSON, "w") as f:
+        json.dump(vectors, f, indent=2)
+    return vectors
+
+
 def main():
     t0 = time.time()
     print("== generating synthetic dataset ==")
@@ -173,6 +200,10 @@ def main():
     print("\n== fitting scaler on train hosts ==")
     scaler = fit_scaler(labeled, train_hosts)
     save_scaler(scaler)
+
+    print("\n== computing per-action mean feature vectors (for branching rollout) ==")
+    stage_means = build_stage_mean_vectors(labeled, scaler, train_hosts)
+    print(f"stage_mean_vectors.json: {len(stage_means)}/{len(STAGE_CLASSES)} action classes covered")
 
     print("\n== building LSTM sequences ==")
     X_train, y_stage_train, y_next_train, y_cur_train, meta_train = build_sequences(labeled, scaler, train_hosts)
