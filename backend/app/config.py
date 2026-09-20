@@ -22,6 +22,7 @@ CALIBRATION_JSON = DATA_DIR / "calibration_report.json"
 LEAD_TIME_JSON = DATA_DIR / "lead_time_report.json"
 FALSE_ALARM_JSON = DATA_DIR / "false_alarm_examples.json"
 FORECAST_LOG_JSON = DATA_DIR / "recent_forecast_log.json"
+STAGE_MEAN_VECTORS_JSON = DATA_DIR / "stage_mean_vectors.json"
 
 LSTM_WEIGHTS = MODELS_DIR / "lstm_world_model.pt"
 LSTM_META = MODELS_DIR / "lstm_world_model_meta.json"
@@ -36,6 +37,21 @@ SEQ_LEN = 8                  # number of past windows the LSTM conditions on
 ROLLOUT_K = 6                # how many windows to roll forward for the forecast curve
 AMBIGUOUS_LOOKBACK = 4       # windows before a hard attack-action onset considered for re-labeling
 AMBIGUOUS_SCORE_THRESHOLD = 0.35  # precursor score above which a benign-labeled window becomes "ambiguous_pre_attack"
+
+# Branching K-step forecast (attack-path tree). Forks the linear rollout()
+# above into the BRANCH_FACTOR most probable next-actions at every step,
+# instead of only ever following the single argmax continuation, so the UI
+# can show "what are the plausible next moves" rather than one committed
+# guess. See models/lstm_world_model.py:branching_rollout for the full
+# design writeup, incl. how sibling branches are made to diverge.
+BRANCH_FACTOR = 3            # candidate next-actions forked at each step
+BRANCH_DEPTH = 4             # tree depth in windows (kept < ROLLOUT_K -- node
+                              # count grows ~BRANCH_FACTOR**depth)
+BRANCH_MIN_PATH_PROB = 0.03  # a branch is pruned once its cumulative path probability drops below this
+BRANCH_STATE_BLEND = 0.5     # 0 = every branch continues from the same model-regressed
+                              # state (branches would only ever differ in their label, not
+                              # in what happens after); 1 = every branch continues purely
+                              # from its class's mean training-data feature vector
 
 RANDOM_SEED = 42
 
