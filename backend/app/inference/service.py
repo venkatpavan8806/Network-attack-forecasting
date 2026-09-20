@@ -13,10 +13,14 @@ from app.config import (
     FEATURE_COLUMNS, SEQ_LEN, ROLLOUT_K, STAGE_CLASSES, IDX_TO_STAGE,
     SYNTHETIC_CSV, DATA_DIR, BENCHMARK_JSON, CALIBRATION_JSON, LEAD_TIME_JSON,
     FALSE_ALARM_JSON, LSTM_WEIGHTS, BASELINE_WEIGHTS, SCALER_WEIGHTS,
+    STAGE_MEAN_VECTORS_JSON, BRANCH_DEPTH, BRANCH_FACTOR,
 )
 from app.labeling.state_labeler import derive_state_labels
 from app.features.extraction import load_scaler
-from app.models.lstm_world_model import load_model, rollout as lstm_rollout, one_step_forecast
+from app.models.lstm_world_model import (
+    load_model, rollout as lstm_rollout, one_step_forecast,
+    branching_rollout as lstm_branching_rollout, enumerate_paths,
+)
 from app.models.baseline_lr import load_baseline
 from app.models.attack_mapping import map_stage
 from app.explain.attention import explain_prediction
@@ -35,6 +39,7 @@ class InferenceService:
         self.baseline = None
         self.scaler = None
         self.labeled_df: pd.DataFrame | None = None
+        self.stage_mean_vectors: dict | None = None
         self.ready = False
 
     def load(self):
@@ -46,6 +51,12 @@ class InferenceService:
         self.model = load_model()
         self.baseline = load_baseline()
         self.scaler = load_scaler()
+
+        if STAGE_MEAN_VECTORS_JSON.exists():
+            with open(STAGE_MEAN_VECTORS_JSON) as f:
+                self.stage_mean_vectors = json.load(f)
+        else:
+            self.stage_mean_vectors = None
 
         labeled_path = DATA_DIR / "labeled_states.csv"
         if labeled_path.exists():
@@ -152,6 +163,54 @@ class InferenceService:
             if len(host_df) < SEQ_LEN:
                 raise ValueError(f"host '{host_id}' has fewer than {SEQ_LEN} windows at/before window {at_window_idx}")
         return self.forecast_host_from_dataframe(host_id, host_df, log_source="live")
+
+    def branching_forecast(self, host_id: str, at_window_idx: int | None = None,
+                            depth: int | None = None, branch_factor: int | None = None):
+        """K-step forecast as a branching attack-path TREE (see
+        app/models/lstm_world_model.py:branching_rollout) instead of the
+        single linear path `forecast_demo_host`'s `rollout` block returns.
+        Every node in the tree carries its MITRE ATT&CK mapping, so this is
+        the "K-step + branching + MITRE" forecast: not just "infiltration
+        probability rises over the next K windows" but "here are the
+        distinct plausible attack-technique continuations, each with its
+        own probability, ranked"."""
+        if self.labeled_df is None:
+            raise ArtifactsNotReadyError("no dataset loaded; run app.train first")
+        host_df = self.labeled_df[self.labeled_df["host_id"] == host_id]
+        if len(host_df) == 0:
+            raise ValueError(f"unknown host_id: {host_id}")
+        if at_window_idx is not None:
+            host_df = host_df[host_df["window_idx"] <= at_window_idx]
+        host_df = host_df.sort_values("window_idx").reset_index(drop=True)
+        if len(host_df) < SEQ_LEN:
+            raise ValueError(f"host '{host_id}' needs at least {SEQ_LEN} windows, has {len(host_df)}")
+
+        end_pos = len(host_df) - 1
+        window = self._window_sequence(host_df, end_pos)
+        kwargs = {}
+        if depth is not None:
+            kwargs["depth"] = depth
+        if branch_factor is not None:
+            kwargs["branch_factor"] = branch_factor
+        tree = lstm_branching_rollout(self.model, window, stage_mean_vectors=self.stage_mean_vectors, **kwargs)
+        paths = enumerate_paths(tree["root"])
+
+        last_row = host_df.iloc[end_pos]
+        most_likely = paths[0] if paths else None
+        highest_risk = max(paths, key=lambda p: p["final_infiltration_probability"]) if paths else None
+
+        return {
+            "host_id": host_id,
+            "window_idx": int(last_row["window_idx"]),
+            "depth": tree["depth"],
+            "branch_factor": tree["branch_factor"],
+            "tree": tree["root"],
+            "paths": paths,
+            "most_likely_path": most_likely,
+            "highest_risk_path": highest_risk,
+            "true_stage": last_row.get("true_stage"),
+            "state_label": last_row.get("state_label"),
+        }
 
     def ingest_csv(self, df: pd.DataFrame):
         """Parses an uploaded CSV of synthetic-telemetry-shaped rows and runs
