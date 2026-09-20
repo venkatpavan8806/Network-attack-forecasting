@@ -8,6 +8,7 @@ import AttackStageBreakdownPanel from '../components/AttackStageBreakdown';
 import ForecastLogTable from '../components/ForecastLogTable';
 import ExplainabilityDigest from '../components/ExplainabilityDigest';
 import TrajectoryChart, { type TrajectoryPoint } from '../components/TrajectoryChart';
+import DefenseAdvisor from '../components/DefenseAdvisor';
 import { NetworkIcon, RadarIcon, AlertIcon, ClockIcon } from '../icons';
 
 export default function Overview({ onNavigateToHost }: { onNavigateToHost: (hostId: string) => void }) {
@@ -17,11 +18,18 @@ export default function Overview({ onNavigateToHost }: { onNavigateToHost: (host
   const [breakdown, setBreakdown] = useState<StageBreakdown | null>(null);
   const [trajectory, setTrajectory] = useState<TrajectoryPoint[]>([]);
 
+  // real-time dashboard: re-read every KPI/log/risk endpoint every 10 s so live-capture
+  // results and CSV ingests show up without a page refresh
   useEffect(() => {
-    api.kpis().then(setKpis).catch(() => {});
-    api.highestRiskHost().then(setHighRisk).catch(() => {});
-    api.forecastLog(30).then(setLog).catch(() => {});
-    api.attackStageBreakdown().then(setBreakdown).catch(() => {});
+    const load = () => {
+      api.kpis().then(setKpis).catch(() => {});
+      api.highestRiskHost().then(setHighRisk).catch(() => {});
+      api.forecastLog(30).then(setLog).catch(() => {});
+      api.attackStageBreakdown().then(setBreakdown).catch(() => {});
+    };
+    load();
+    const timer = window.setInterval(load, 10000);
+    return () => window.clearInterval(timer);
   }, []);
 
   useEffect(() => {
@@ -37,7 +45,7 @@ export default function Overview({ onNavigateToHost }: { onNavigateToHost: (host
       ];
       setTrajectory(points);
     }).catch(() => {});
-  }, [highRisk]);
+  }, [highRisk?.host_id, highRisk?.window_idx]);
 
   return (
     <div className="flex flex-col gap-6">
@@ -74,6 +82,12 @@ export default function Overview({ onNavigateToHost }: { onNavigateToHost: (host
         </div>
         <HighestRiskCard host={highRisk} onView={onNavigateToHost} />
       </div>
+
+      <DefenseAdvisor
+        hostId={highRisk?.host_id ?? null}
+        atWindowIdx={highRisk?.window_idx}
+        title="Defense Advisor — Highest-Risk Host"
+      />
 
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
         <div className="card p-6">
