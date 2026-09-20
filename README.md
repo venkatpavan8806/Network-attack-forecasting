@@ -40,7 +40,7 @@ backend/
     labeling/state_labeler.py state-labeling engine (incl. ambiguous_pre_attack derivation)
     features/extraction.py    scaler, host-level train/val/test split, sequence building
     models/
-      lstm_world_model.py     LSTM world model (attention + rollout + saliency)
+      lstm_world_model.py     LSTM world model (attention + rollout + branching rollout + saliency)
       baseline_lr.py          logistic regression baseline
       attack_mapping.py       MITRE ATT&CK stage lookup
     explain/
@@ -55,7 +55,7 @@ backend/
     api/main.py                FastAPI app
     db.py                      SQLite-backed inference log (KPIs, forecast log table)
     train.py                   end-to-end training/evaluation entry point
-  tests/                      pytest suite (28 tests)
+  tests/                      pytest suite (75 tests)
   data/                       generated CSVs + JSON reports (all produced by train.py)
   models_store/               saved LSTM weights + baseline + scaler
 frontend/
@@ -71,7 +71,7 @@ cd backend
 python -m venv venv
 venv\Scripts\pip install -r requirements.txt
 venv\Scripts\python -m app.train        # generates data, trains both models, computes all reports (~30s on CPU)
-venv\Scripts\python -m pytest -q        # 28 tests
+venv\Scripts\python -m pytest -q        # 75 tests
 venv\Scripts\python -m uvicorn app.api.main:app --port 8000
 ```
 
@@ -166,6 +166,48 @@ the model itself assigned it — no extra hand-tuning on top).
 Training: combined cross-entropy (class-balanced, since attack windows are
 rare) + MSE loss, Adam, early stopping on a held-out validation split (by
 host, never by row — see below).
+
+## Branching K-step forecast + MITRE ATT&CK kill-chain
+
+`rollout()` above produces one committed path: at every step it follows only
+the model's own argmax continuation. `app/models/lstm_world_model.py:branching_rollout`
+forks that into an actual **attack-forecast tree**: at every step it keeps the
+`BRANCH_FACTOR` (default 3) most probable next actions instead of just one,
+prunes any branch whose cumulative path probability drops below
+`BRANCH_MIN_PATH_PROB`, and stops at `BRANCH_DEPTH` (default 4) steps. Every
+node carries the MITRE ATT&CK mapping for its action
+(`app/models/attack_mapping.py`), so the tree reads directly as a set of
+plausible, ranked ATT&CK kill-chain continuations — "70% chance of
+`T1595 Active Scanning` next, forking into a 55% continuation toward
+`T1110 Brute Force (SSH)` and a 20% continuation toward `T1110 Brute Force
+(RDP)`" — rather than a single infiltration-probability number.
+
+**Making sibling branches actually diverge:** `next_state_head` regresses one
+continuous feature vector per input regardless of which action a branch
+picks, so naively feeding every branch that same vector back in would make
+sibling branches differ only in their label for exactly one step, then
+collapse back onto an identical continuation. To avoid that,
+`app/train.py:build_stage_mean_vectors` computes, once per training run and
+from **train hosts only** (same split the scaler is fit on — no test/val
+leakage), the mean normalized feature vector observed for windows of each
+action class, saved to `data/stage_mean_vectors.json`. Each branch's
+continued state is then a blend — `BRANCH_STATE_BLEND` (default 0.5) — of the
+model's own regressed `next_state` and that branch's class-mean vector: "if
+the world actually goes down this branch, also nudge the rolling assumption
+of the traffic itself toward what that action typically looks like." This is
+a documented heuristic layered on top of a real trained model, not a second
+learned model, and it only affects which branches get shown — it is never
+used in training or in any reported benchmark/calibration/lead-time metric.
+
+Exposed via `GET /forecast/{host_id}/branches`
+(`app/inference/service.py:branching_forecast`) and rendered in the
+"Branching Attack-Path Forecast" card on the Forecasts tab
+(`frontend/src/components/BranchingForecastTree.tsx`), alongside the
+single highest-path-probability continuation and the continuation with the
+highest final infiltration probability, each shown as an ordered MITRE
+kill-chain. `backend/tests/test_lstm.py` covers tree shape/depth/pruning and
+that branches genuinely condition on the chosen action (not just cosmetically
+labeled).
 
 ## Explainability
 
@@ -279,7 +321,7 @@ downloaded for this pass, per project scope.
 
 ## Tests
 
-`backend/tests/` — 28 tests, `pytest -q` from `backend/`:
+`backend/tests/` — 75 tests, `pytest -q` from `backend/`:
 
 - `test_generator.py` — output shape/columns, no stage leakage, attack hosts
   cover the full progression, evasive recon has lower flow volume than fast
@@ -292,7 +334,8 @@ downloaded for this pass, per project scope.
   evasive host is pinned to test, sequence/single-window table shapes.
 - `test_lstm.py` — forward-pass shapes, attention weights sum to 1,
   infiltration-probability range, rollout output shapes/ranges, saliency
-  shape and finiteness.
+  shape and finiteness, branching-rollout tree shape/depth/pruning and that
+  sibling branches genuinely diverge (not cosmetically labeled).
 - `test_baseline.py` — baseline trains and separates a synthetic separable
   case, metrics dict has the expected keys.
 - `test_attack_mapping.py` — every stage class has a mapping, unknown stage
@@ -308,6 +351,8 @@ FastAPI app (`app/api/main.py`), fully offline:
 - `GET /health`, `GET /kpis`, `GET /highest-risk-host`, `GET /hosts`
 - `GET /forecast/{host_id}` — real one-step forecast + K-step rollout +
   explanation for a demo host
+- `GET /forecast/{host_id}/branches` — K-step forecast as a branching
+  MITRE-mapped attack-path tree (see "Branching K-step forecast" above)
 - `POST /sandbox/test` — genuinely validates an uploaded CSV and returns
   `outcome: "failure"` with specific reasons when the input actually is
   malformed (missing columns, non-numeric values, too few windows per host)
