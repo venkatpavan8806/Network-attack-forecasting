@@ -94,18 +94,6 @@ def forecast(host_id: str, at_window_idx: int | None = None):
         raise HTTPException(status_code=404, detail=str(e))
 
 
-@app.get("/forecast/{host_id}/branches")
-def forecast_branches(host_id: str, at_window_idx: int | None = None,
-                       depth: int | None = None, branch_factor: int | None = None):
-    """K-step forecast as a branching attack-path tree, each node MITRE-mapped
-    -- see app/inference/service.py:branching_forecast."""
-    _require_ready()
-    try:
-        return service.branching_forecast(host_id, at_window_idx=at_window_idx, depth=depth, branch_factor=branch_factor)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-
-
 @app.get("/host-timeline/{host_id}")
 def host_timeline(host_id: str):
     """Windows + ground-truth action for one host -- lets the UI offer
@@ -137,6 +125,35 @@ def counterfactual(host_id: str, mitigation_id: str = "isolate_host", at_window_
         return service.run_counterfactual(host_id, mitigation_id, at_window_idx=at_window_idx)
     except ValueError as e:
         raise HTTPException(status_code=404 if "unknown host_id" in str(e) else 400, detail=str(e))
+
+
+@app.get("/shap/{host_id}")
+def shap_explanation(host_id: str, at_window_idx: int | None = None):
+    """SHAP on the baseline next to attention + saliency on the LSTM, for the
+    same host/window. Works for demo hosts and for `live:<ip>` hosts from the
+    live capture. See app/explain/shap_baseline.py and app/explain/attention.py."""
+    _require_ready()
+    try:
+        return service.explain_shap(host_id, at_window_idx=at_window_idx)
+    except ValueError as e:
+        raise HTTPException(status_code=404 if "unknown host_id" in str(e) else 400, detail=str(e))
+    except ArtifactsNotReadyError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.get("/defense/{host_id}")
+def defense_advice(host_id: str, at_window_idx: int | None = None):
+    """Ranked defensive recommendation computed from real counterfactual
+    rollouts of the trained world model (every mitigation vs. no mitigation),
+    plus the ATT&CK-mapped manual playbook for the stage the model expects.
+    Decision support only -- nothing is applied to any network."""
+    _require_ready()
+    try:
+        return service.defense_advice(host_id, at_window_idx=at_window_idx)
+    except ValueError as e:
+        raise HTTPException(status_code=404 if "unknown host_id" in str(e) else 400, detail=str(e))
+    except ArtifactsNotReadyError as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 class SandboxTestResponse(BaseModel):
