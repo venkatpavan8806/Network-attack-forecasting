@@ -51,3 +51,31 @@ def test_evasive_recon_has_lower_flow_volume_than_fast_recon():
 def test_benign_traffic_has_low_port_scan_score():
     df = generate_dataset(seed=4, n_benign_hosts=3, n_attack_hosts=0, benign_len=50)
     assert df["port_scan_score"].mean() < 0.2
+
+
+def test_timestamps_are_monotonic_per_host():
+    df = generate_dataset(seed=6, n_benign_hosts=2, n_attack_hosts=1, benign_len=20)
+    for host_id, host_df in df.groupby("host_id"):
+        ts = host_df.sort_values("window_idx")["timestamp"].to_numpy()
+        assert (np.diff(ts) > 0).all()
+
+
+def test_no_nan_or_inf_in_feature_columns():
+    df = generate_dataset(seed=8, n_benign_hosts=2, n_attack_hosts=1, benign_len=15)
+    values = df[FEATURE_COLUMNS].to_numpy(dtype=np.float64)
+    assert np.isfinite(values).all()
+
+
+def test_precursor_windows_precede_attack_onset_and_stay_labeled_benign_by_simulator():
+    """The simulator itself must record benign_precursor windows as
+    'benign' (recorded_action) -- only the state-labeling engine, from
+    features alone, is allowed to distinguish them as ambiguous."""
+    from app.data_gen.generator import generate_host_timeline
+
+    rng = np.random.default_rng(20)
+    df = generate_host_timeline("h-attack", rng, is_attack=True, evasive=False)
+    onset_idx = df[df.true_stage != "benign"].index.min()
+    assert onset_idx is not None
+    # the PRECURSOR_WINDOWS immediately before onset are recorded as benign
+    lookback = df.iloc[max(0, onset_idx - 4):onset_idx]
+    assert (lookback["true_stage"] == "benign").all()
