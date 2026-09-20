@@ -1,14 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, STAGE_COLORS, STAGE_LABELS } from '../api';
-import type { ForecastResponse, SandboxTestResult } from '../types';
+import type { ForecastResponse, BranchingForecastResponse, SandboxTestResult } from '../types';
 import CardHeader from '../components/CardHeader';
 import TrajectoryChart, { type TrajectoryPoint } from '../components/TrajectoryChart';
+import BranchingForecastTree, { PathSummaryList } from '../components/BranchingForecastTree';
 import LiveCapturePanel from '../components/LiveCapturePanel';
 import { UploadIcon } from '../icons';
 
 export default function Forecasts({ selectedHost, onSelectHost }: { selectedHost: string | null; onSelectHost: (h: string) => void }) {
   const [hosts, setHosts] = useState<string[]>([]);
   const [forecast, setForecast] = useState<ForecastResponse | null>(null);
+  const [branching, setBranching] = useState<BranchingForecastResponse | null>(null);
+  const [branchingLoading, setBranchingLoading] = useState(false);
   const [loading, setLoading] = useState(false);
   const [uploadResult, setUploadResult] = useState<SandboxTestResult | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
@@ -25,6 +28,8 @@ export default function Forecasts({ selectedHost, onSelectHost }: { selectedHost
     if (!selectedHost) return;
     setLoading(true);
     api.forecast(selectedHost).then(setForecast).finally(() => setLoading(false)).catch(() => setLoading(false));
+    setBranchingLoading(true);
+    api.branchingForecast(selectedHost).then(setBranching).finally(() => setBranchingLoading(false)).catch(() => setBranchingLoading(false));
   }, [selectedHost]);
 
   const trajectory: TrajectoryPoint[] = forecast
@@ -129,6 +134,26 @@ export default function Forecasts({ selectedHost, onSelectHost }: { selectedHost
               )}
             </div>
           </div>
+        )}
+      </div>
+
+      <div className="card p-6">
+        <CardHeader
+          title="Branching Attack-Path Forecast"
+          subtitle={branching ? `K-step forecast forked into the ${branching.branch_factor} most probable next actions at each of ${branching.depth} steps, each node MITRE ATT&CK-mapped` : 'K-step + branching + MITRE ATT&CK mapping'}
+        />
+        {branchingLoading && <div className="text-sm text-[var(--color-ink-faint)] py-8 text-center">building attack-path tree…</div>}
+        {!branchingLoading && branching && (
+          <div className="flex flex-col gap-6">
+            <BranchingForecastTree tree={branching.tree} />
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2 border-t border-[var(--color-accent-soft)]">
+              {branching.most_likely_path && <PathSummaryList title="Most likely continuation" paths={[branching.most_likely_path]} />}
+              {branching.highest_risk_path && <PathSummaryList title="Highest-risk continuation" paths={[branching.highest_risk_path]} />}
+            </div>
+          </div>
+        )}
+        {!branchingLoading && !branching && (
+          <div className="text-sm text-[var(--color-ink-faint)] py-8 text-center">no branching forecast available for this host</div>
         )}
       </div>
     </div>
