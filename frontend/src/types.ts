@@ -144,41 +144,9 @@ export interface HostTimelineEntry {
   state_label: string;
 }
 
-export interface BranchNode {
-  stage: string | null;
-  step_probability: number | null;
-  path_probability: number;
-  infiltration_probability: number | null;
-  attack_mapping: AttackMapping | null;
-  depth: number;
-  children: BranchNode[];
-}
-
-export interface BranchPath {
-  stages: string[];
-  path_probability: number;
-  final_infiltration_probability: number;
-  mitre_kill_chain: (AttackMapping & { stage: string })[];
-}
-
-export interface BranchingForecastResponse {
-  host_id: string;
-  window_idx: number;
-  depth: number;
-  branch_factor: number;
-  tree: BranchNode;
-  paths: BranchPath[];
-  most_likely_path: BranchPath | null;
-  highest_risk_path: BranchPath | null;
-  true_stage: string | null;
-  state_label: string | null;
-}
-
 export interface MitigationInfo {
   id: string;
   label: string;
-  category?: string;
-  target_stage?: string;
   description: string;
 }
 
@@ -203,8 +171,6 @@ export interface CounterfactualResponse {
   action_divergences: ActionDivergence[];
   true_stage: string | null;
   state_label: string | null;
-  risk_reduction_pct?: number;
-  verdict?: string;
 }
 
 export interface LiveInterface {
@@ -242,4 +208,84 @@ export interface LiveWindowEntry {
   infiltration_probability_world_model: number | null;
   infiltration_probability_baseline: number | null;
   stage_probabilities?: Record<string, number>;
+}
+
+// ---- SHAP (baseline) vs attention + saliency (LSTM) -------------------------
+export interface ShapContribution {
+  feature: string;
+  raw_value: number;
+  scaled_value: number; // z-score vs. training data
+  shap_value: number;   // log-odds; + pushes toward "malicious"
+  direction: 'raises_risk' | 'lowers_risk';
+}
+
+export interface ShapResponse {
+  host_id: string;
+  window_idx: number;
+  true_stage: string | null;
+  state_label: string | null;
+  shap: {
+    base_value_logit: number;
+    prediction_logit: number;
+    baseline_probability: number;
+    model_probability: number;
+    sum_of_all_shap_values: number;
+    contributions: ShapContribution[];
+  };
+  lstm: {
+    infiltration_probability: number;
+    attention_over_past_windows: number[];
+    top_contributors: TopContributor[];
+  };
+  agreement: {
+    shap_top_features: string[];
+    lstm_top_features: string[];
+    shared_features: string[];
+    jaccard: number;
+  };
+}
+
+// ---- Defense advisor ----------------------------------------------------------
+export interface DefenseEvidence {
+  id: string;
+  label: string;
+  description: string;
+  mean_probability_without: number;
+  mean_probability_with: number;
+  mean_reduction: number;
+  relative_reduction: number;
+  peak_reduction: number;
+  stages_changed: number;
+  disruption_tier: number;
+  disruption: 'low' | 'medium' | 'high';
+  effective: boolean;
+}
+
+export interface PlaybookMitigation {
+  id: string | null;
+  name: string;
+  action: string;
+}
+
+export interface DefenseAdvice {
+  host_id: string;
+  window_idx: number;
+  risk_level: 'act_now' | 'watch' | 'monitor';
+  peak_probability: number;
+  expected_stage: string | null;
+  horizon_windows: number;
+  recommended: DefenseEvidence | null;
+  recommendation_reason: string | null;
+  evidence: DefenseEvidence[];
+  playbook: {
+    summary: string;
+    mitigations: PlaybookMitigation[];
+    analyst_steps: string[];
+    attack_mapping?: AttackMapping | null;
+  };
+  method: { computed: string; static: string; limits: string; thresholds: Record<string, number> };
+  true_stage: string | null;
+  state_label: string | null;
+  trajectory_without: number[];
+  trajectory_with_recommended: number[] | null;
 }
