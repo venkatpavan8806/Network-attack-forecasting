@@ -144,6 +144,36 @@ export interface HostTimelineEntry {
   state_label: string;
 }
 
+export interface BranchNode {
+  stage: string | null;
+  step_probability: number | null;
+  path_probability: number;
+  infiltration_probability: number | null;
+  attack_mapping: AttackMapping | null;
+  depth: number;
+  children: BranchNode[];
+}
+
+export interface BranchPath {
+  stages: string[];
+  path_probability: number;
+  final_infiltration_probability: number;
+  mitre_kill_chain: (AttackMapping & { stage: string })[];
+}
+
+export interface BranchingForecastResponse {
+  host_id: string;
+  window_idx: number;
+  depth: number;
+  branch_factor: number;
+  tree: BranchNode;
+  paths: BranchPath[];
+  most_likely_path: BranchPath | null;
+  highest_risk_path: BranchPath | null;
+  true_stage: string | null;
+  state_label: string | null;
+}
+
 export interface MitigationInfo {
   id: string;
   label: string;
