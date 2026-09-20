@@ -1,5 +1,4 @@
 import { useState } from 'react';
-import Sidebar from './components/Sidebar';
 import Topbar from './components/Topbar';
 import Overview from './pages/Overview';
 import Forecasts from './pages/Forecasts';
@@ -20,7 +19,6 @@ export default function App() {
 
   return (
     <div className="min-h-screen flex bg-[var(--color-page)]">
-      <Sidebar active={tab} onChange={setTab} />
       <main className="flex-1 px-4 sm:px-8 py-6 max-w-[1400px] mx-auto w-full">
         <Topbar active={tab} onChange={setTab} />
         <div className="mt-6">
