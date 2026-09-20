@@ -6,13 +6,95 @@ across train/test.
 from __future__ import annotations
 
 import json
+import math
 
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 import joblib
 
-from app.config import FEATURE_COLUMNS, SEQ_LEN, STAGE_TO_IDX, RANDOM_SEED, SCALER_WEIGHTS
+from app.config import FEATURE_COLUMNS, SEQ_LEN, STAGE_TO_IDX, RANDOM_SEED, SCALER_WEIGHTS, N_FEATURES
+
+
+class FeatureValidationError(ValueError):
+    """Raised by validate_feature_vector when a feature vector does not
+    conform to the authoritative FEATURE_COLUMNS schema."""
+
+
+def validate_feature_vector(features):
+    """Validates a single window's feature vector against the authoritative
+    `FEATURE_COLUMNS` schema (the single source of truth used by synthetic
+    generation, feature extraction, state construction, normalization, model
+    input, and live inference).
+
+    This is a VALIDATION function only -- it never sanitizes or repairs
+    data. Any safe-default/fallback handling for missing or unmeasurable
+    values belongs at feature-extraction time (see e.g.
+    app/live/flow_tracker.py, which already guards every mean/std
+    computation so it never emits NaN/Inf in the first place), not here.
+
+    Accepts either:
+      - a dict/Mapping of {feature_name: value}, in ANY key order, or
+      - a sequence/1-D array-like of length N_FEATURES, whose order is
+        interpreted as FEATURE_COLUMNS order (that's the caller's
+        responsibility -- there's no key to check it against for an
+        unlabeled sequence).
+
+    Checks performed:
+      * for dict input: the key SET matches FEATURE_COLUMNS exactly (no
+        missing keys, no unexpected extra keys). Insertion/iteration order
+        of the dict does NOT matter -- a valid dict is accepted regardless
+        of what order its keys happen to be in.
+      * for array-like input: length is exactly N_FEATURES.
+      * every value is numeric (bool is rejected).
+      * every value is finite: NaN and +/-Inf are REJECTED with a
+        FeatureValidationError, never silently replaced.
+
+    Returns:
+      np.ndarray of shape (N_FEATURES,), dtype float64, explicitly
+      constructed in canonical FEATURE_COLUMNS order regardless of the
+      input dict's own key order -- so callers can use this as the single
+      choke point before scaling/model input.
+
+    Raises:
+      FeatureValidationError on any schema violation: missing/extra keys,
+      wrong dimensionality, non-numeric values, or any NaN/Inf value.
+    """
+    if isinstance(features, dict):
+        provided_set = set(features.keys())
+        expected_set = set(FEATURE_COLUMNS)
+
+        missing = expected_set - provided_set
+        if missing:
+            raise FeatureValidationError(f"feature vector is missing required features: {sorted(missing)}")
+
+        extra = provided_set - expected_set
+        if extra:
+            raise FeatureValidationError(f"feature vector has unexpected features: {sorted(extra)}")
+
+        # Key SET is validated above; insertion order is irrelevant. The
+        # output vector is always explicitly re-projected into canonical
+        # FEATURE_COLUMNS order here, regardless of what order the caller's
+        # dict keys were in.
+        values = [features[c] for c in FEATURE_COLUMNS]
+    else:
+        arr = np.asarray(features, dtype=object).reshape(-1)
+        if arr.shape[0] != N_FEATURES:
+            raise FeatureValidationError(
+                f"feature vector has {arr.shape[0]} dimensions, expected {N_FEATURES} (FEATURE_COLUMNS)"
+            )
+        values = list(arr)
+
+    out = np.empty(N_FEATURES, dtype=np.float64)
+    for i, (name, v) in enumerate(zip(FEATURE_COLUMNS, values)):
+        if isinstance(v, bool) or not isinstance(v, (int, float, np.integer, np.floating)):
+            raise FeatureValidationError(f"feature '{name}' has non-numeric value: {v!r} ({type(v).__name__})")
+        fv = float(v)
+        if math.isnan(fv) or math.isinf(fv):
+            raise FeatureValidationError(f"feature '{name}' is NaN/Inf: {fv}")
+        out[i] = fv
+
+    return out
 
 
 def host_split(labeled_df: pd.DataFrame, seed: int = RANDOM_SEED):
