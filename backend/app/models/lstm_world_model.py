@@ -37,7 +37,9 @@ import torch.nn.functional as F
 from app.config import (
     N_FEATURES, STAGE_CLASSES, STAGE_TO_IDX, IDX_TO_STAGE, SEQ_LEN,
     LSTM_WEIGHTS, LSTM_META, ROLLOUT_K,
+    BRANCH_FACTOR, BRANCH_DEPTH, BRANCH_MIN_PATH_PROB, BRANCH_STATE_BLEND,
 )
+from app.models.attack_mapping import map_stage
 
 N_CLASSES = len(STAGE_CLASSES)
 BENIGN_IDX = STAGE_TO_IDX["benign"]
@@ -180,6 +182,118 @@ def rollout(model: LSTMWorldModel, seed_window: np.ndarray, k: int = ROLLOUT_K):
         "predicted_stage": predicted_stage,
         "attn_weights_step1": attn_weights_step1,
     }
+
+
+@torch.no_grad()
+def branching_rollout(model: LSTMWorldModel, seed_window: np.ndarray,
+                       stage_mean_vectors: dict[str, list[float]] | None = None,
+                       depth: int = BRANCH_DEPTH, branch_factor: int = BRANCH_FACTOR,
+                       min_path_prob: float = BRANCH_MIN_PATH_PROB,
+                       state_blend: float = BRANCH_STATE_BLEND) -> dict:
+    """K-step forecast as a branching tree instead of a single committed
+    path: at every step, forks into the `branch_factor` most probable next
+    actions (rather than only ever following rollout()'s single argmax
+    continuation), and drops any branch whose cumulative path probability
+    falls under `min_path_prob`. Each node carries the MITRE ATT&CK mapping
+    for its action, so the tree reads directly as a set of plausible
+    ATT&CK kill-chain continuations, not just probability numbers.
+
+    Making sibling branches actually diverge: `next_state_head` regresses
+    one continuous feature vector per input regardless of which action
+    ends up chosen for a branch, so if every branch fed that exact vector
+    back in, siblings would differ only in their own label and be
+    IDENTICAL again one step later (the tree would collapse back to a
+    single line). To avoid that, each branch's continued state is a blend
+    of the model's own regressed next_state (weight `1 - state_blend`) and
+    that branch's action's mean observed (normalized) feature vector from
+    the training data (weight `state_blend`, from `stage_mean_vectors`,
+    see app/train.py) -- i.e. "if the world actually goes down this
+    branch, also nudge the rolling assumption of the traffic itself toward
+    what that action typically looks like". This is a documented
+    heuristic on top of a real trained model, not a second learned model,
+    and it only affects which branches get shown -- it never feeds back
+    into training or the reported benchmark/calibration/lead-time metrics.
+
+    Returns a dict:
+      root: the tree root node (dict with "children", see _expand below);
+            root itself has stage=None (it represents "now", the seed window)
+      depth, branch_factor: echoed back for the caller/UI
+    """
+    model.eval()
+
+    def _blend(next_state_np: np.ndarray, stage: str) -> np.ndarray:
+        if not stage_mean_vectors or stage not in stage_mean_vectors:
+            return next_state_np
+        class_vec = np.asarray(stage_mean_vectors[stage], dtype=np.float32)
+        return (1.0 - state_blend) * next_state_np + state_blend * class_vec
+
+    root = {"stage": None, "step_probability": None, "path_probability": 1.0,
+            "infiltration_probability": None, "attack_mapping": None,
+            "depth": 0, "children": []}
+    frontier = [(root, seed_window)]  # (node, seq: (seq_len, n_features) np.float32
+
+    for step in range(1, depth + 1):
+        next_frontier = []
+        for node, seq in frontier:
+            seq_t = torch.tensor(seq, dtype=torch.float32).unsqueeze(0)
+            stage_logits, next_state, _ = model(seq_t)
+            probs = F.softmax(stage_logits, dim=1).squeeze(0).numpy()
+            next_state_np = next_state.squeeze(0).numpy()
+            infilt = infiltration_probability(probs)
+
+            top_idx = np.argsort(-probs)[:branch_factor]
+            for idx in top_idx:
+                stage = IDX_TO_STAGE[int(idx)]
+                step_p = float(probs[idx])
+                path_p = node["path_probability"] * step_p
+                if path_p < min_path_prob:
+                    continue
+                child = {
+                    "stage": stage,
+                    "step_probability": round(step_p, 4),
+                    "path_probability": round(path_p, 4),
+                    "infiltration_probability": round(infilt, 4),
+                    "attack_mapping": map_stage(stage),
+                    "depth": step,
+                    "children": [],
+                }
+                node["children"].append(child)
+                if step < depth:
+                    branch_state = _blend(next_state_np, stage).astype(np.float32)
+                    branch_seq = np.concatenate([seq[1:], branch_state[None, :]], axis=0)
+                    next_frontier.append((child, branch_seq))
+        frontier = next_frontier
+
+    return {"root": root, "depth": depth, "branch_factor": branch_factor}
+
+
+def enumerate_paths(root: dict) -> list[dict]:
+    """Flattens a branching_rollout() tree into one entry per root-to-leaf
+    path, each a plausible multi-step ATT&CK kill-chain continuation.
+    Sorted by path_probability descending -- paths[0] is the single most
+    probable continuation (which, since branch_factor's top-1 candidate at
+    each step is exactly what rollout() would have followed, is the
+    branching tree's linear-rollout-equivalent path)."""
+    paths: list[dict] = []
+
+    def _walk(node: dict, trail: list[dict]):
+        children = node.get("children", [])
+        if not children:
+            if trail:  # skip the root-only "empty path" case
+                paths.append({
+                    "stages": [n["stage"] for n in trail],
+                    "path_probability": trail[-1]["path_probability"],
+                    "final_infiltration_probability": trail[-1]["infiltration_probability"],
+                    "mitre_kill_chain": [
+                        {"stage": n["stage"], **n["attack_mapping"]} for n in trail
+                    ],
+                })
+            return
+        for child in children:
+            _walk(child, trail + [child])
+
+    _walk(root, [])
+    return sorted(paths, key=lambda p: p["path_probability"], reverse=True)
 
 
 @torch.no_grad()
