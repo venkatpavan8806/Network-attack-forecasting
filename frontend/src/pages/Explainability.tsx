@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { api, STAGE_COLORS } from '../api';
 import type { ForecastResponse, FalseAlarmExample } from '../types';
 import CardHeader from '../components/CardHeader';
+import ShapPanel from '../components/ShapPanel';
 
 export default function Explainability({ selectedHost }: { selectedHost: string | null }) {
   const [forecast, setForecast] = useState<ForecastResponse | null>(null);
@@ -74,6 +75,8 @@ export default function Explainability({ selectedHost }: { selectedHost: string 
           <div className="text-sm text-[var(--color-ink-faint)] py-8 text-center">not yet available</div>
         )}
       </div>
+
+      <ShapPanel hostId={selectedHost} />
 
       <div className="card p-6">
         <CardHeader
