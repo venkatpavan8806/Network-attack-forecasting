@@ -9,7 +9,7 @@ from app.config import N_FEATURES, SEQ_LEN, STAGE_CLASSES, FEATURE_COLUMNS
 from app.data_gen.generator import generate_dataset
 from app.labeling.state_labeler import derive_state_labels
 from app.features.extraction import host_split, fit_scaler, build_sequences, build_single_window_table
-from app.models.lstm_world_model import LSTMWorldModel, rollout
+from app.models.lstm_world_model import LSTMWorldModel, rollout, branching_rollout, enumerate_paths
 from app.models.baseline_lr import train_baseline
 from app.evaluation.metrics import run_full_benchmark
 from app.explain.attention import explain_prediction
@@ -78,3 +78,13 @@ def test_full_pipeline_end_to_end(tmp_path):
     roll = rollout(model, window, k=4)
     assert len(roll["infiltration_probs"]) == 4
     assert all(0.0 <= p <= 1.0 for p in roll["infiltration_probs"])
+
+    # branching K-step forecast, using real train.py-style per-action mean vectors
+    from app.train import build_stage_mean_vectors
+    stage_means = build_stage_mean_vectors(labeled, scaler, train_hosts)
+    tree = branching_rollout(model, window, stage_mean_vectors=stage_means, depth=3, branch_factor=2, min_path_prob=0.0)
+    paths = enumerate_paths(tree["root"])
+    assert len(paths) > 0
+    for p in paths:
+        assert len(p["stages"]) == 3
+        assert all(m["technique_id"] is not None or m["stage"] == "benign" for m in p["mitre_kill_chain"])
