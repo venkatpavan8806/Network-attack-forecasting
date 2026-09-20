@@ -94,6 +94,18 @@ def forecast(host_id: str, at_window_idx: int | None = None):
         raise HTTPException(status_code=404, detail=str(e))
 
 
+@app.get("/forecast/{host_id}/branches")
+def forecast_branches(host_id: str, at_window_idx: int | None = None,
+                       depth: int | None = None, branch_factor: int | None = None):
+    """K-step forecast as a branching attack-path tree, each node MITRE-mapped
+    -- see app/inference/service.py:branching_forecast."""
+    _require_ready()
+    try:
+        return service.branching_forecast(host_id, at_window_idx=at_window_idx, depth=depth, branch_factor=branch_factor)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 @app.get("/host-timeline/{host_id}")
 def host_timeline(host_id: str):
     """Windows + ground-truth action for one host -- lets the UI offer
