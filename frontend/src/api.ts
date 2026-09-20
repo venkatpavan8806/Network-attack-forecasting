@@ -4,7 +4,7 @@ import type {
   BenchmarkReport, CalibrationReport, LeadTimeReport, FalseAlarmExample,
   SandboxTestResult, AttackMapping, MitigationInfo, CounterfactualResponse,
   HostTimelineEntry, LiveStatus, LiveWindowEntry, LiveInterface, TripwireAlert,
-  BranchingForecastResponse,
+  ShapResponse, DefenseAdvice,
 } from './types';
 
 const client = axios.create({ baseURL: '/api' });
@@ -17,14 +17,6 @@ export const api = {
   hostTimeline: (hostId: string) => client.get<HostTimelineEntry[]>(`/host-timeline/${hostId}`).then((r) => r.data),
   forecast: (hostId: string, atWindowIdx?: number) =>
     client.get<ForecastResponse>(`/forecast/${hostId}`, { params: atWindowIdx != null ? { at_window_idx: atWindowIdx } : {} }).then((r) => r.data),
-  branchingForecast: (hostId: string, atWindowIdx?: number, depth?: number, branchFactor?: number) =>
-    client.get<BranchingForecastResponse>(`/forecast/${hostId}/branches`, {
-      params: {
-        ...(atWindowIdx != null ? { at_window_idx: atWindowIdx } : {}),
-        ...(depth != null ? { depth } : {}),
-        ...(branchFactor != null ? { branch_factor: branchFactor } : {}),
-      },
-    }).then((r) => r.data),
   attackStageBreakdown: () => client.get<StageBreakdown>('/attack-stage-breakdown').then((r) => r.data),
   forecastLog: (limit = 25) => client.get<ForecastLogRow[]>('/forecast-log', { params: { limit } }).then((r) => r.data),
   attackMapping: () => client.get<AttackMapping[]>('/attack-mapping').then((r) => r.data),
@@ -38,6 +30,10 @@ export const api = {
     client.get<CounterfactualResponse>(`/counterfactual/${hostId}`, {
       params: { mitigation_id: mitigationId, ...(atWindowIdx != null ? { at_window_idx: atWindowIdx } : {}) },
     }).then((r) => r.data),
+  shap: (hostId: string, atWindowIdx?: number) =>
+    client.get<ShapResponse>(`/shap/${encodeURIComponent(hostId)}`, { params: atWindowIdx != null ? { at_window_idx: atWindowIdx } : {} }).then((r) => r.data),
+  defense: (hostId: string, atWindowIdx?: number) =>
+    client.get<DefenseAdvice>(`/defense/${encodeURIComponent(hostId)}`, { params: atWindowIdx != null ? { at_window_idx: atWindowIdx } : {} }).then((r) => r.data),
   sandboxTest: (file: File) => {
     const form = new FormData();
     form.append('file', file);
