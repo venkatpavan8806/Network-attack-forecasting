@@ -12,21 +12,21 @@ import pandas as pd
 from app.config import (
     FEATURE_COLUMNS, SEQ_LEN, ROLLOUT_K, STAGE_CLASSES, IDX_TO_STAGE,
     SYNTHETIC_CSV, DATA_DIR, BENCHMARK_JSON, CALIBRATION_JSON, LEAD_TIME_JSON,
-    FALSE_ALARM_JSON, LSTM_WEIGHTS, BASELINE_WEIGHTS, SCALER_WEIGHTS,
-    STAGE_MEAN_VECTORS_JSON, BRANCH_DEPTH, BRANCH_FACTOR,
+    FALSE_ALARM_JSON, LSTM_WEIGHTS, BASELINE_WEIGHTS, SCALER_WEIGHTS, RANDOM_SEED,
 )
 from app.labeling.state_labeler import derive_state_labels
 from app.features.extraction import load_scaler
-from app.models.lstm_world_model import (
-    load_model, rollout as lstm_rollout, one_step_forecast,
-    branching_rollout as lstm_branching_rollout, enumerate_paths,
-)
+from app.models.lstm_world_model import load_model, rollout as lstm_rollout, one_step_forecast
 from app.models.baseline_lr import load_baseline
 from app.models.attack_mapping import map_stage
 from app.explain.attention import explain_prediction
+from app.explain.shap_baseline import BaselineShapExplainer
+from app.defense.advisor import build_advice
 from app.simulation.mitigations import get_mitigation_fn, list_mitigations
-from app.simulation.counterfactual import compare_with_and_without
+from app.simulation.counterfactual import compare_with_and_without, rollout_counterfactual
 from app import db
+
+SHAP_BACKGROUND_SIZE = 200  # normal-traffic windows used as SHAP's reference point
 
 
 class ArtifactsNotReadyError(RuntimeError):
@@ -39,7 +39,7 @@ class InferenceService:
         self.baseline = None
         self.scaler = None
         self.labeled_df: pd.DataFrame | None = None
-        self.stage_mean_vectors: dict | None = None
+        self.shap_explainer: BaselineShapExplainer | None = None
         self.ready = False
 
     def load(self):
@@ -52,12 +52,6 @@ class InferenceService:
         self.baseline = load_baseline()
         self.scaler = load_scaler()
 
-        if STAGE_MEAN_VECTORS_JSON.exists():
-            with open(STAGE_MEAN_VECTORS_JSON) as f:
-                self.stage_mean_vectors = json.load(f)
-        else:
-            self.stage_mean_vectors = None
-
         labeled_path = DATA_DIR / "labeled_states.csv"
         if labeled_path.exists():
             self.labeled_df = pd.read_csv(labeled_path)
@@ -67,9 +61,24 @@ class InferenceService:
         else:
             self.labeled_df = None
 
+        self.shap_explainer = self._build_shap_explainer()
+
         db.init_db()
         db.seed_from_training_log()
         self.ready = True
+
+    def _build_shap_explainer(self) -> BaselineShapExplainer | None:
+        """SHAP needs a reference point. We use real NORMAL windows from the
+        dataset (scaled exactly like the model input) so every SHAP value
+        reads as 'how much did this feature move the score away from normal'."""
+        if self.labeled_df is None:
+            return None
+        normal = self.labeled_df[self.labeled_df["true_stage"] == "benign"]
+        if len(normal) == 0:
+            return None
+        sample = normal.sample(n=min(SHAP_BACKGROUND_SIZE, len(normal)), random_state=RANDOM_SEED)
+        background = self.scaler.transform(sample[FEATURE_COLUMNS].values)
+        return BaselineShapExplainer(self.baseline, background)
 
     # -- validation -----------------------------------------------------
     def validate_telemetry_csv(self, df: pd.DataFrame) -> list[str]:
@@ -164,54 +173,6 @@ class InferenceService:
                 raise ValueError(f"host '{host_id}' has fewer than {SEQ_LEN} windows at/before window {at_window_idx}")
         return self.forecast_host_from_dataframe(host_id, host_df, log_source="live")
 
-    def branching_forecast(self, host_id: str, at_window_idx: int | None = None,
-                            depth: int | None = None, branch_factor: int | None = None):
-        """K-step forecast as a branching attack-path TREE (see
-        app/models/lstm_world_model.py:branching_rollout) instead of the
-        single linear path `forecast_demo_host`'s `rollout` block returns.
-        Every node in the tree carries its MITRE ATT&CK mapping, so this is
-        the "K-step + branching + MITRE" forecast: not just "infiltration
-        probability rises over the next K windows" but "here are the
-        distinct plausible attack-technique continuations, each with its
-        own probability, ranked"."""
-        if self.labeled_df is None:
-            raise ArtifactsNotReadyError("no dataset loaded; run app.train first")
-        host_df = self.labeled_df[self.labeled_df["host_id"] == host_id]
-        if len(host_df) == 0:
-            raise ValueError(f"unknown host_id: {host_id}")
-        if at_window_idx is not None:
-            host_df = host_df[host_df["window_idx"] <= at_window_idx]
-        host_df = host_df.sort_values("window_idx").reset_index(drop=True)
-        if len(host_df) < SEQ_LEN:
-            raise ValueError(f"host '{host_id}' needs at least {SEQ_LEN} windows, has {len(host_df)}")
-
-        end_pos = len(host_df) - 1
-        window = self._window_sequence(host_df, end_pos)
-        kwargs = {}
-        if depth is not None:
-            kwargs["depth"] = depth
-        if branch_factor is not None:
-            kwargs["branch_factor"] = branch_factor
-        tree = lstm_branching_rollout(self.model, window, stage_mean_vectors=self.stage_mean_vectors, **kwargs)
-        paths = enumerate_paths(tree["root"])
-
-        last_row = host_df.iloc[end_pos]
-        most_likely = paths[0] if paths else None
-        highest_risk = max(paths, key=lambda p: p["final_infiltration_probability"]) if paths else None
-
-        return {
-            "host_id": host_id,
-            "window_idx": int(last_row["window_idx"]),
-            "depth": tree["depth"],
-            "branch_factor": tree["branch_factor"],
-            "tree": tree["root"],
-            "paths": paths,
-            "most_likely_path": most_likely,
-            "highest_risk_path": highest_risk,
-            "true_stage": last_row.get("true_stage"),
-            "state_label": last_row.get("state_label"),
-        }
-
     def ingest_csv(self, df: pd.DataFrame):
         """Parses an uploaded CSV of synthetic-telemetry-shaped rows and runs
         real inference for the LAST window of every host present in it."""
@@ -235,27 +196,16 @@ class InferenceService:
         host_df = self.labeled_df[self.labeled_df["host_id"] == host_id].sort_values("window_idx").reset_index(drop=True)
         if len(host_df) == 0:
             raise ValueError(f"unknown host_id: {host_id}")
-
-        # If at_window_idx is not provided, intelligently pick the active attack onset window
-        # so the digital twin demonstrates intervention at the critical moment
-        if at_window_idx is None:
-            non_benign = host_df[host_df["true_stage"] != "benign"]
-            if len(non_benign) > 0:
-                at_window_idx = int(non_benign.iloc[0]["window_idx"])
-            else:
-                at_window_idx = int(host_df.iloc[-1]["window_idx"])
-
-        host_df = host_df[host_df["window_idx"] <= at_window_idx].reset_index(drop=True)
+        if at_window_idx is not None:
+            host_df = host_df[host_df["window_idx"] <= at_window_idx].reset_index(drop=True)
         if len(host_df) < SEQ_LEN:
-            raise ValueError(f"host '{host_id}' needs at least {SEQ_LEN} windows up to window #{at_window_idx}, has {len(host_df)}")
+            raise ValueError(f"host '{host_id}' needs at least {SEQ_LEN} windows, has {len(host_df)}")
 
         mitigation_fn = get_mitigation_fn(mitigation_id)
         end_pos = len(host_df) - 1
         seed_raw = host_df[FEATURE_COLUMNS].values[end_pos - SEQ_LEN + 1: end_pos + 1].astype(np.float32)
 
-        baseline_roll, mitigated_roll, metrics = compare_with_and_without(
-            self.model, self.scaler, seed_raw, mitigation_fn, k=ROLLOUT_K
-        )
+        baseline_roll, mitigated_roll = compare_with_and_without(self.model, self.scaler, seed_raw, mitigation_fn, k=ROLLOUT_K)
 
         last_row = host_df.iloc[end_pos]
         mitigations_meta = {m["id"]: m for m in list_mitigations()}
@@ -272,7 +222,7 @@ class InferenceService:
         return {
             "host_id": host_id,
             "window_idx": int(last_row["window_idx"]),
-            "mitigation": mitigations_meta.get(mitigation_id, {"id": mitigation_id, "label": mitigation_id, "description": ""}),
+            "mitigation": mitigations_meta[mitigation_id],
             "horizon_windows": ROLLOUT_K,
             "without_mitigation": {
                 "infiltration_probs": [round(p, 4) for p in baseline_roll["infiltration_probs"]],
@@ -285,9 +235,6 @@ class InferenceService:
             "action_divergences": divergences,
             "true_stage": last_row.get("true_stage"),
             "state_label": last_row.get("state_label"),
-            "metrics": metrics,
-            "risk_reduction_pct": metrics["risk_reduction_pct"],
-            "verdict": metrics["verdict"],
         }
 
     def available_mitigations(self):
@@ -297,6 +244,102 @@ class InferenceService:
         if self.labeled_df is None:
             return []
         return sorted(self.labeled_df["host_id"].unique().tolist())
+
+    # -- shared: raw seed window for a demo host OR a live-capture host --------
+    def _raw_seed(self, host_id: str, at_window_idx: int | None = None):
+        """Returns (seed_raw, window_idx, true_stage, state_label) where seed_raw is the
+        RAW (unscaled) (SEQ_LEN, n_features) window ending at the host's latest window
+        (or `at_window_idx`). Works for CSV/demo hosts and for `live:<ip>` hosts,
+        whose history is whatever the live packet capture has really accumulated."""
+        if host_id.startswith("live:"):
+            from app.live.capture import live_capture  # local import: avoids a circular import at load time
+            remote_ip = host_id[len("live:"):]
+            hist = live_capture.history.get(remote_ip)
+            if hist is None:
+                raise ValueError(f"unknown host_id: {host_id} (not seen by the live capture)")
+            rows = list(hist)
+            if len(rows) < SEQ_LEN:
+                raise ValueError(f"live host '{host_id}' has {len(rows)}/{SEQ_LEN} windows of history so far")
+            return (np.stack(rows).astype(np.float32),
+                    int(live_capture.window_counter.get(remote_ip, len(rows))), None, None)
+
+        if self.labeled_df is None:
+            raise ArtifactsNotReadyError("no dataset loaded; run app.train first")
+        host_df = self.labeled_df[self.labeled_df["host_id"] == host_id].sort_values("window_idx").reset_index(drop=True)
+        if len(host_df) == 0:
+            raise ValueError(f"unknown host_id: {host_id}")
+        if at_window_idx is not None:
+            host_df = host_df[host_df["window_idx"] <= at_window_idx].reset_index(drop=True)
+        if len(host_df) < SEQ_LEN:
+            raise ValueError(f"host '{host_id}' needs at least {SEQ_LEN} windows, has {len(host_df)}")
+        end_pos = len(host_df) - 1
+        seed_raw = host_df[FEATURE_COLUMNS].values[end_pos - SEQ_LEN + 1: end_pos + 1].astype(np.float32)
+        last_row = host_df.iloc[end_pos]
+        return seed_raw, int(last_row["window_idx"]), last_row.get("true_stage"), last_row.get("state_label")
+
+    # -- SHAP (baseline) next to attention + saliency (LSTM) --------------------
+    def explain_shap(self, host_id: str, at_window_idx: int | None = None, top_k: int = 8):
+        """Two explanations of the SAME moment, side by side:
+          * SHAP on the logistic-regression baseline (sees only the current window)
+          * attention x input-gradient saliency on the LSTM (sees the last SEQ_LEN windows)
+        plus how much their top features agree."""
+        if self.shap_explainer is None:
+            raise ArtifactsNotReadyError("SHAP explainer unavailable: no normal-traffic reference data loaded")
+        seed_raw, window_idx, true_stage, state_label = self._raw_seed(host_id, at_window_idx)
+        seed_scaled = self.scaler.transform(seed_raw).astype(np.float32)
+
+        shap_out = self.shap_explainer.explain(seed_scaled[-1], seed_raw[-1], top_k=top_k)
+        model_prob = float(self.baseline.predict_proba(seed_scaled[-1:])[0, 1])
+        lstm = explain_prediction(self.model, seed_scaled, top_k=top_k)
+
+        shap_top = [c["feature"] for c in shap_out["contributions"][:5]]
+        lstm_top = list(dict.fromkeys(c["feature"] for c in lstm["top_contributors"]))[:5]
+        shared = sorted(set(shap_top) & set(lstm_top))
+        union = set(shap_top) | set(lstm_top)
+
+        return {
+            "host_id": host_id,
+            "window_idx": window_idx,
+            "true_stage": true_stage,
+            "state_label": state_label,
+            "shap": {
+                **shap_out,
+                "model_probability": round(model_prob, 4),  # baseline.predict_proba -- must match baseline_probability
+            },
+            "lstm": {
+                "infiltration_probability": lstm["infiltration_probability"],
+                "attention_over_past_windows": lstm["attention_over_past_windows"],
+                "top_contributors": lstm["top_contributors"],
+            },
+            "agreement": {
+                "shap_top_features": shap_top,
+                "lstm_top_features": lstm_top,
+                "shared_features": shared,
+                "jaccard": round(len(shared) / len(union), 3) if union else 0.0,
+            },
+        }
+
+    # -- defense: rank every mitigation by what the world model says it achieves ---
+    def defense_advice(self, host_id: str, at_window_idx: int | None = None):
+        seed_raw, window_idx, true_stage, state_label = self._raw_seed(host_id, at_window_idx)
+        seed_scaled = self.scaler.transform(seed_raw).astype(np.float32)
+
+        unmitigated = lstm_rollout(self.model, seed_scaled, k=ROLLOUT_K)
+        meta = {m["id"]: m for m in list_mitigations()}
+        mitigated = {
+            mid: rollout_counterfactual(self.model, self.scaler, seed_raw, get_mitigation_fn(mid), k=ROLLOUT_K)
+            for mid in meta if mid != "no_mitigation"
+        }
+
+        advice = build_advice(host_id, window_idx, unmitigated, mitigated, meta)
+        advice["true_stage"] = true_stage
+        advice["state_label"] = state_label
+        advice["trajectory_without"] = [round(p, 4) for p in unmitigated["infiltration_probs"]]
+        rec = advice["recommended"]
+        advice["trajectory_with_recommended"] = (
+            [round(p, 4) for p in mitigated[rec["id"]]["infiltration_probs"]] if rec else None
+        )
+        return advice
 
     # -- precomputed reports ---------------------------------------------
     def load_report(self, path):
