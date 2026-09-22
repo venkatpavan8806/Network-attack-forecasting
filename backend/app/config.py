@@ -22,6 +22,7 @@ CALIBRATION_JSON = DATA_DIR / "calibration_report.json"
 LEAD_TIME_JSON = DATA_DIR / "lead_time_report.json"
 FALSE_ALARM_JSON = DATA_DIR / "false_alarm_examples.json"
 FORECAST_LOG_JSON = DATA_DIR / "recent_forecast_log.json"
+STAGE_MEAN_VECTORS_JSON = DATA_DIR / "stage_mean_vectors.json"
 
 LSTM_WEIGHTS = MODELS_DIR / "lstm_world_model.pt"
 LSTM_META = MODELS_DIR / "lstm_world_model_meta.json"
@@ -115,6 +116,21 @@ WINDOW_SECONDS = 30          # duration of one time window
 WINDOW_STEP = WINDOW_SECONDS  # stride between windows; == WINDOW_SECONDS (non-overlapping); not read by any code today
 SEQ_LEN = 8                  # number of past windows the LSTM conditions on
 ROLLOUT_K = 6                # how many windows to roll forward for the forecast curve
+
+# Branching K-step forecast (attack-path tree). Forks the linear rollout()
+# above into the BRANCH_FACTOR most probable next-actions at every step,
+# instead of only ever following the single argmax continuation, so the UI
+# can show "what are the plausible next moves" rather than one committed
+# guess. See models/lstm_world_model.py:branching_rollout for the full
+# design writeup, incl. how sibling branches are made to diverge.
+BRANCH_FACTOR = 3            # candidate next-actions forked at each step
+BRANCH_DEPTH = 4             # tree depth in windows (kept < ROLLOUT_K -- node
+                              # count grows ~BRANCH_FACTOR**depth)
+BRANCH_MIN_PATH_PROB = 0.03  # a branch is pruned once its cumulative path probability drops below this
+BRANCH_STATE_BLEND = 0.5     # 0 = every branch continues from the same model-regressed
+                              # state (branches would only ever differ in their label, not
+                              # in what happens after); 1 = every branch continues purely
+                              # from its class's mean training-data feature vector
 
 # ---------------------------------------------------------------------------
 # Pre-detection / precursor labeling parameters
@@ -264,6 +280,63 @@ ATTACK_STAGE_MAP = {
         "technique_id": "T1041",
         "technique_name": "Exfiltration Over C2 Channel",
         "tactic": "Exfiltration",
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Tools & likely-consequence reference table -- curated security-analyst
+# knowledge, NOT a model output. The LSTM predicts the ACTION CATEGORY from
+# traffic features alone (flag counts, timing, ports); it never sees tool
+# fingerprints or payload content, so it has no basis to infer which
+# specific tool an attacker is running. This table attaches typical tooling
+# and likely system impact to whichever action the model predicts, the same
+# way ATTACK_STAGE_MAP attaches a MITRE technique ID -- an enrichment layer
+# on top of the prediction, not part of the prediction itself.
+# ---------------------------------------------------------------------------
+TOOLS_AND_IMPACT_MAP = {
+    "benign": {
+        "likely_tools": None,
+        "likely_system_state": "Normal operation -- no attacker activity detected.",
+    },
+    "ambiguous_pre_attack": {
+        "likely_tools": "Unconfirmed -- this is an early precursor signal, not a specific technique yet.",
+        "likely_system_state": "No confirmed compromise. Elevated precursor signal only -- treat as a watch condition, not an incident.",
+    },
+    "port_scan": {
+        "likely_tools": "Nmap, Masscan, ZMap, or a custom SYN-scan script",
+        "likely_system_state": "Attacker has enumerated open ports/services. No host compromised yet, but the attack surface is now known to the attacker.",
+    },
+    "ssh_bruteforce": {
+        "likely_tools": "Hydra, Medusa, Ncrack, or a custom credential-stuffing script",
+        "likely_system_state": "If successful: attacker obtains valid SSH credentials and gains interactive shell access to the host.",
+    },
+    "rdp_bruteforce": {
+        "likely_tools": "Hydra, Crowbar, NLBrute, or a custom RDP credential-spraying tool",
+        "likely_system_state": "If successful: attacker obtains valid RDP credentials and gains full remote-desktop control of the host.",
+    },
+    "smb_bruteforce": {
+        "likely_tools": "Hydra, CrackMapExec, Responder (relay), or a custom SMB credential-spraying tool",
+        "likely_system_state": "If successful: attacker obtains valid SMB/Windows credentials and gains access to file shares and admin endpoints.",
+    },
+    "ssh_lateral_movement": {
+        "likely_tools": "Stolen SSH keys/credentials with scp/rsync, or SSH tunneling/ProxyJump pivoting",
+        "likely_system_state": "Attacker uses compromised SSH access to reach additional internal hosts -- network segmentation has been breached.",
+    },
+    "rdp_lateral_movement": {
+        "likely_tools": "Stolen RDP credentials, PsExec, or RDP session hijacking tools",
+        "likely_system_state": "Attacker pivots to additional internal Windows hosts via RDP -- network segmentation has been breached.",
+    },
+    "smb_lateral_movement": {
+        "likely_tools": "PsExec, WMIC, Impacket (psexec.py / wmiexec.py), or PowerShell remoting",
+        "likely_system_state": "Attacker moves laterally using stolen SMB/Windows credentials -- often paired with credential dumping (e.g. Mimikatz) on newly reached hosts.",
+    },
+    "c2_beacon": {
+        "likely_tools": "Cobalt Strike, Metasploit, Sliver, or a custom C2 framework beaconing over HTTPS/DNS",
+        "likely_system_state": "A persistent command-and-control channel is established -- the attacker maintains remote control and can issue further commands at will.",
+    },
+    "data_exfiltration": {
+        "likely_tools": "rclone, curl/scp, DNS tunneling tools, or abused cloud-sync utilities",
+        "likely_system_state": "Sensitive data is leaving the network. If not stopped, this represents a completed data breach.",
     },
 }
 

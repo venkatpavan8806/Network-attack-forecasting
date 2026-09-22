@@ -41,12 +41,19 @@ from __future__ import annotations
 
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
 import numpy as np
 
 from app.config import FEATURE_COLUMNS, WINDOW_SECONDS, WATCHED_PORTS
+
+PORT_SERVICE_NAMES = {22: "SSH", 445: "SMB", 3389: "RDP", 443: "HTTPS"}
+
+# how many raw packets to keep per remote host for on-demand inspection --
+# independent of window rollovers, capped so a chatty host can't grow this
+# without bound
+PACKET_LOG_MAXLEN = 300
 
 
 @dataclass
@@ -59,6 +66,34 @@ class PacketRecord:
     ttl: int
     win_size: int
     pkt_len: int
+
+
+def describe_packet(rec: PacketRecord) -> str:
+    """Plain-English description of a single captured packet, for the
+    per-host packet drill-down in the UI. Not a model output -- a direct,
+    deterministic read of the TCP flags/ports on the actual packet."""
+    is_syn, is_ack, is_rst, is_fin, is_psh = ("S" in rec.flags, "A" in rec.flags,
+                                               "R" in rec.flags, "F" in rec.flags, "P" in rec.flags)
+    watched_port = rec.local_port if rec.direction == "in" else rec.remote_port
+    service = PORT_SERVICE_NAMES.get(watched_port)
+    port_note = f" [{service}]" if service else ""
+
+    if is_rst:
+        base = "Connection reset/refused (RST)"
+    elif is_syn and is_ack:
+        base = "Remote accepted the connection (SYN-ACK)" if rec.direction == "in" else "We accepted their connection (SYN-ACK)"
+    elif is_syn:
+        base = "New connection attempt from them (SYN)" if rec.direction == "in" else "We opened a new connection (SYN)"
+    elif is_fin:
+        base = "Connection closing (FIN)"
+    elif is_psh and is_ack:
+        base = f"Data transfer, {rec.pkt_len} bytes (PSH-ACK)"
+    elif is_ack:
+        base = "Acknowledgement on an ongoing connection (ACK)"
+    else:
+        base = f"TCP segment (flags={rec.flags or 'none'})"
+
+    return base + port_note
 
 
 @dataclass
@@ -75,6 +110,9 @@ class FlowTracker:
         self._lock = threading.Lock()
         self._buckets: dict[str, _RemoteBucket] = defaultdict(_RemoteBucket)
         self._times_seen: dict[str, int] = defaultdict(int)  # persists across windows
+        # raw per-packet log for on-demand inspection -- independent of window
+        # rollovers (never cleared by roll_window), capped per remote host
+        self._packet_log: dict[str, deque] = defaultdict(lambda: deque(maxlen=PACKET_LOG_MAXLEN))
 
     def ingest_tcp(self, remote_ip: str, direction: str, local_port: int, remote_port: int,
                     flags: str, ttl: int, win_size: int, pkt_len: int, ts: float | None = None):
@@ -82,6 +120,30 @@ class FlowTracker:
                             remote_port=remote_port, flags=flags, ttl=ttl, win_size=win_size, pkt_len=pkt_len)
         with self._lock:
             self._buckets[remote_ip].records.append(rec)
+            self._packet_log[remote_ip].append(rec)
+
+    def recent_packets(self, remote_ip: str, limit: int = 100) -> list[dict]:
+        """Raw, individual packets captured to/from this remote host, most
+        recent first -- for the per-host packet drill-down in the UI. This is
+        NOT filtered by the initiation-direction rule the aggregate features
+        use; it shows everything actually seen, exactly as captured."""
+        with self._lock:
+            recs = list(self._packet_log.get(remote_ip, []))
+        recs = recs[-limit:][::-1]
+        return [
+            {
+                "timestamp": r.ts,
+                "direction": r.direction,
+                "local_port": r.local_port,
+                "remote_port": r.remote_port,
+                "flags": r.flags,
+                "ttl": r.ttl,
+                "win_size": r.win_size,
+                "pkt_len": r.pkt_len,
+                "description": describe_packet(r),
+            }
+            for r in recs
+        ]
 
     def _features_for_bucket(self, remote_ip: str, bucket: _RemoteBucket) -> dict | None:
         recs = bucket.records

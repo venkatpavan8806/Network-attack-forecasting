@@ -3,14 +3,32 @@ import { api, STAGE_COLORS } from '../api';
 import type { ForecastResponse, FalseAlarmExample } from '../types';
 import CardHeader from '../components/CardHeader';
 import ShapPanel from '../components/ShapPanel';
+import { pickInterestingWindowIdx } from '../hostWindow';
 
 export default function Explainability({ selectedHost }: { selectedHost: string | null }) {
   const [forecast, setForecast] = useState<ForecastResponse | null>(null);
   const [falseAlarms, setFalseAlarms] = useState<FalseAlarmExample[]>([]);
+  const [atWindowIdx, setAtWindowIdx] = useState<number | undefined>(undefined);
 
   useEffect(() => {
     if (!selectedHost) return;
-    api.forecast(selectedHost).then(setForecast).catch(() => {});
+    const isLive = selectedHost.startsWith('live:');
+    if (isLive) {
+      setAtWindowIdx(undefined);
+      api.forecast(selectedHost).then(setForecast).catch(() => {});
+      return;
+    }
+    // Default to the end of the host's first non-benign segment instead of
+    // its last window -- a demo host's timeline always ends in a benign
+    // tail, so "last window" would show nothing interesting to explain.
+    api.hostTimeline(selectedHost).then((t) => {
+      const w = pickInterestingWindowIdx(t);
+      setAtWindowIdx(w);
+      api.forecast(selectedHost, w).then(setForecast).catch(() => {});
+    }).catch(() => {
+      setAtWindowIdx(undefined);
+      api.forecast(selectedHost).then(setForecast).catch(() => {});
+    });
   }, [selectedHost]);
 
   useEffect(() => {
@@ -76,7 +94,7 @@ export default function Explainability({ selectedHost }: { selectedHost: string 
         )}
       </div>
 
-      <ShapPanel hostId={selectedHost} />
+      <ShapPanel hostId={selectedHost} atWindowIdx={atWindowIdx} />
 
       <div className="card p-6">
         <CardHeader

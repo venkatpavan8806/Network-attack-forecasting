@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
-  ScatterChart, Scatter, Line, ComposedChart,
+  Scatter, Line, ComposedChart,
 } from 'recharts';
 import { api } from '../api';
 import type { BenchmarkReport, CalibrationReport, LeadTimeReport } from '../types';
@@ -46,7 +46,7 @@ export default function Benchmarks() {
                 <CartesianGrid stroke="#eceafa" vertical={false} />
                 <XAxis dataKey="metric" tick={{ fontSize: 12, fill: '#8b8a9e' }} axisLine={false} tickLine={false} />
                 <YAxis domain={[0, 1]} tick={{ fontSize: 11, fill: '#8b8a9e' }} axisLine={false} tickLine={false} />
-                <Tooltip formatter={(v: number) => v.toFixed(4)} />
+                <Tooltip formatter={(v) => Number(v).toFixed(4)} />
                 <Legend />
                 <Bar dataKey="Baseline" fill="#ff6b81" radius={[6, 6, 0, 0]} />
                 <Bar dataKey="World Model" fill="#6c5dd3" radius={[6, 6, 0, 0]} />
@@ -77,7 +77,7 @@ export default function Benchmarks() {
                   <CartesianGrid stroke="#eceafa" />
                   <XAxis dataKey="predicted" type="number" domain={[0, 1]} tickFormatter={(v) => `${Math.round(v * 100)}%`} tick={{ fontSize: 11, fill: '#8b8a9e' }} axisLine={false} tickLine={false} name="Predicted" />
                   <YAxis dataKey="observed" type="number" domain={[0, 1]} tickFormatter={(v) => `${Math.round(v * 100)}%`} tick={{ fontSize: 11, fill: '#8b8a9e' }} axisLine={false} tickLine={false} name="Observed" />
-                  <Tooltip formatter={(v: number) => `${(v * 100).toFixed(1)}%`} />
+                  <Tooltip formatter={(v) => `${(Number(v) * 100).toFixed(1)}%`} />
                   <Line type="monotone" dataKey="perfect" stroke="#d8d4f0" strokeDasharray="4 4" dot={false} name="Perfect calibration" />
                   <Scatter dataKey="observed" fill="#6c5dd3" name="Observed frequency" />
                 </ComposedChart>

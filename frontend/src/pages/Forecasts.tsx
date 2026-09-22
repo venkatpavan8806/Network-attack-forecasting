@@ -1,10 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, STAGE_COLORS, STAGE_LABELS } from '../api';
-import type { ForecastResponse, BranchingForecastResponse, SandboxTestResult } from '../types';
+import type { AttackMapping, ForecastResponse, BranchingForecastResponse, SandboxTestResult } from '../types';
+import { pickInterestingWindowIdx } from '../hostWindow';
 import CardHeader from '../components/CardHeader';
 import TrajectoryChart, { type TrajectoryPoint } from '../components/TrajectoryChart';
 import BranchingForecastTree, { PathSummaryList } from '../components/BranchingForecastTree';
 import LiveCapturePanel from '../components/LiveCapturePanel';
+import MitreForecastGraph from '../components/MitreForecastGraph';
+import AttackForecastDetails from '../components/AttackForecastDetails';
+import { downloadForecastPdf } from '../pdfReport';
 import { UploadIcon } from '../icons';
 
 export default function Forecasts({ selectedHost, onSelectHost }: { selectedHost: string | null; onSelectHost: (h: string) => void }) {
@@ -15,6 +19,7 @@ export default function Forecasts({ selectedHost, onSelectHost }: { selectedHost
   const [loading, setLoading] = useState(false);
   const [uploadResult, setUploadResult] = useState<SandboxTestResult | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [attackMapping, setAttackMapping] = useState<AttackMapping[]>([]);
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -22,14 +27,28 @@ export default function Forecasts({ selectedHost, onSelectHost }: { selectedHost
       setHosts(h);
       if (!selectedHost && h.length) onSelectHost(h[0]);
     }).catch(() => {});
+    api.attackMapping().then(setAttackMapping).catch(() => {});
   }, []);
 
   useEffect(() => {
     if (!selectedHost) return;
+    const isLive = selectedHost.startsWith('live:');
     setLoading(true);
-    api.forecast(selectedHost).then(setForecast).finally(() => setLoading(false)).catch(() => setLoading(false));
     setBranchingLoading(true);
-    api.branchingForecast(selectedHost).then(setBranching).finally(() => setBranchingLoading(false)).catch(() => setBranchingLoading(false));
+
+    const run = (atWindowIdx: number | undefined) => {
+      api.forecast(selectedHost, atWindowIdx).then(setForecast).finally(() => setLoading(false)).catch(() => setLoading(false));
+      api.branchingForecast(selectedHost, atWindowIdx).then(setBranching).finally(() => setBranchingLoading(false)).catch(() => setBranchingLoading(false));
+    };
+
+    if (isLive) {
+      run(undefined);
+      return;
+    }
+    // Default to the end of the host's first non-benign segment instead of
+    // its last window -- a demo host's timeline always ends in a benign
+    // tail, so "last window" would show nothing interesting.
+    api.hostTimeline(selectedHost).then((t) => run(pickInterestingWindowIdx(t))).catch(() => run(undefined));
   }, [selectedHost]);
 
   const trajectory: TrajectoryPoint[] = forecast
@@ -89,13 +108,23 @@ export default function Forecasts({ selectedHost, onSelectHost }: { selectedHost
       <div className="card p-6">
         <div className="flex items-center justify-between mb-5 flex-wrap gap-3">
           <CardHeader title="Host Forecast Explorer" subtitle="Select a host to run a real one-step forecast + K-step rollout" />
-          <select
-            value={selectedHost ?? ''}
-            onChange={(e) => onSelectHost(e.target.value)}
-            className="px-3 py-2 rounded-xl border border-[var(--color-accent-soft)] text-sm bg-white text-[var(--color-ink)]"
-          >
-            {hosts.map((h) => <option key={h} value={h}>{h}</option>)}
-          </select>
+          <div className="flex items-center gap-2">
+            <select
+              value={selectedHost ?? ''}
+              onChange={(e) => onSelectHost(e.target.value)}
+              className="px-3 py-2 rounded-xl border border-[var(--color-accent-soft)] text-sm bg-white text-[var(--color-ink)]"
+            >
+              {hosts.map((h) => <option key={h} value={h}>{h}</option>)}
+            </select>
+            {forecast && (
+              <button
+                onClick={() => downloadForecastPdf(forecast, attackMapping)}
+                className="px-4 py-2 rounded-full bg-[var(--color-accent)] text-white text-sm font-medium flex items-center gap-2"
+              >
+                <UploadIcon size={14} className="rotate-180" /> Download PDF
+              </button>
+            )}
+          </div>
         </div>
 
         {loading && <div className="text-sm text-[var(--color-ink-faint)] py-8 text-center">running inference…</div>}
@@ -118,12 +147,6 @@ export default function Forecasts({ selectedHost, onSelectHost }: { selectedHost
                   ))}
                 </div>
               </div>
-              {forecast.attack_mapping.technique_id && (
-                <div className="text-xs bg-[var(--color-accent-soft)] rounded-xl p-3 text-[var(--color-ink)]">
-                  <div className="font-semibold">{forecast.attack_mapping.technique_id} — {forecast.attack_mapping.technique_name}</div>
-                  <div className="text-[var(--color-ink-dim)] mt-0.5">{forecast.attack_mapping.tactic}</div>
-                </div>
-              )}
               {forecast.true_stage && (
                 <div className="text-xs text-[var(--color-ink-faint)]">
                   ground truth: <span className="font-medium text-[var(--color-ink-dim)]">{forecast.true_stage}</span>
@@ -133,6 +156,34 @@ export default function Forecasts({ selectedHost, onSelectHost }: { selectedHost
                 </div>
               )}
             </div>
+          </div>
+        )}
+
+        {!loading && forecast && (
+          <div className="mt-6 pt-5 border-t border-[var(--color-accent-soft)]">
+            <div className="mb-3">
+              <h4 className="text-sm font-semibold text-[var(--color-ink)]">Attack Type, Tools &amp; Likely System State</h4>
+              <p className="text-xs text-[var(--color-ink-dim)] mt-0.5">
+                What the model predicts, what tools are typically used for it, and what happens to the system if it succeeds.
+              </p>
+            </div>
+            <AttackForecastDetails action={forecast.predicted_stage} mapping={forecast.attack_mapping} />
+          </div>
+        )}
+
+        {!loading && forecast && attackMapping.length > 0 && (
+          <div className="mt-6 pt-5 border-t border-[var(--color-accent-soft)]">
+            <div className="mb-3">
+              <h4 className="text-sm font-semibold text-[var(--color-ink)]">MITRE ATT&CK Forecast — Branching Next Actions</h4>
+              <p className="text-xs text-[var(--color-ink-dim)] mt-0.5">
+                Positioned by real MITRE tactic (Reconnaissance → Credential Access → Lateral Movement → C2 → Exfiltration). Hover a node for its technique ID.
+              </p>
+            </div>
+            <MitreForecastGraph
+              stageProbabilitiesNow={forecast.stage_probabilities}
+              branchingForecast={forecast.rollout.branching_forecast}
+              attackMapping={attackMapping}
+            />
           </div>
         )}
       </div>

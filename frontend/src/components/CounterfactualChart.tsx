@@ -26,15 +26,29 @@ function CustomTooltip({ active, payload, label }: any) {
 }
 
 export default function CounterfactualChart({ data }: { data: CounterfactualPoint[] }) {
+  const maxDiff = Math.max(
+    0,
+    ...data.map((d) => (d.without != null && d.with_ != null ? Math.abs(d.without - d.with_) : 0)),
+  );
+  const linesOverlap = maxDiff < 0.01; // under 1 percentage point apart at every step
+
   return (
     <div className="w-full h-64">
-      <div className="flex items-center justify-end gap-4 mb-1 text-xs text-[var(--color-ink-dim)]">
-        <span className="flex items-center gap-1.5">
-          <span className="w-2 h-2 rounded-full bg-[var(--color-bad)]" /> Without mitigation
-        </span>
-        <span className="flex items-center gap-1.5">
-          <span className="w-2 h-2 rounded-full bg-[var(--color-good)]" /> With mitigation
-        </span>
+      <div className="flex items-center justify-between gap-4 mb-1">
+        <div className="flex items-center gap-4 text-xs text-[var(--color-ink-dim)]">
+          <span className="flex items-center gap-1.5">
+            <span className="w-3 h-0.5 rounded-full bg-[var(--color-bad)]" /> Without mitigation
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="w-3.5 h-0 border-t-2 border-dashed" style={{ borderColor: 'var(--color-good)' }} />
+            With mitigation (dashed)
+          </span>
+        </div>
+        {linesOverlap && (
+          <span className="text-[10px] text-[var(--color-ink-faint)] bg-[var(--color-accent-soft)] px-2 py-0.5 rounded-full">
+            lines overlap — probability barely moved, see below for what changed
+          </span>
+        )}
       </div>
       <ResponsiveContainer width="100%" height="100%">
         <LineChart data={data} margin={{ top: 10, right: 10, left: -10, bottom: 0 }}>
@@ -49,7 +63,16 @@ export default function CounterfactualChart({ data }: { data: CounterfactualPoin
           />
           <Tooltip content={<CustomTooltip />} cursor={{ stroke: '#d8d4f0', strokeWidth: 1 }} />
           <Line type="monotone" dataKey="without" stroke="#ff6b81" strokeWidth={2.5} dot={{ r: 3 }} activeDot={{ r: 5 }} connectNulls />
-          <Line type="monotone" dataKey="with_" stroke="#3dd598" strokeWidth={2.5} dot={{ r: 3 }} activeDot={{ r: 5 }} connectNulls />
+          <Line
+            type="monotone"
+            dataKey="with_"
+            stroke="#3dd598"
+            strokeWidth={2.5}
+            strokeDasharray="6 4"
+            dot={{ r: 3 }}
+            activeDot={{ r: 5 }}
+            connectNulls
+          />
         </LineChart>
       </ResponsiveContainer>
     </div>

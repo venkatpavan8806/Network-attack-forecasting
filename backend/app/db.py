@@ -31,6 +31,17 @@ CREATE TABLE IF NOT EXISTS inference_log (
 );
 CREATE INDEX IF NOT EXISTS idx_inference_created_at ON inference_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_inference_host ON inference_log(host_id);
+
+CREATE TABLE IF NOT EXISTS tripwire_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    remote_ip TEXT NOT NULL,
+    message TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    detail_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tripwire_created_at ON tripwire_alerts(created_at);
+CREATE INDEX IF NOT EXISTS idx_tripwire_remote_ip ON tripwire_alerts(remote_ip);
 """
 
 
@@ -53,7 +64,27 @@ def init_db():
 def log_inference(host_id: str, window_idx: int, model: str, predicted_stage: str | None,
                    infiltration_probability: float, true_stage: str | None = None,
                    state_label: str | None = None, source: str = "live"):
+    """Logs one real inference call. Skips the insert if it would be an exact
+    repeat of the immediately-preceding row for this (host_id, model) pair --
+    a demo host's prediction is deterministic (frozen weights, same input),
+    so re-polling it (e.g. the Overview page's 10s refresh) would otherwise
+    flood the 'Recent Forecast Log' / 'Explainability Digest' UI with copies
+    of the same event instead of genuinely new activity. Scoped to `model`
+    too: one forecast call logs both "world_model_lstm" and
+    "baseline_logreg" rows for the same window, so comparing only against
+    the single most recent row (regardless of model) would never match --
+    it would always be the OTHER model's row. A live host's window_idx
+    advances every real window, so its rows are never skipped by this."""
     with get_conn() as conn:
+        last = conn.execute(
+            "SELECT window_idx, predicted_stage, infiltration_probability, source "
+            "FROM inference_log WHERE host_id = ? AND model = ? ORDER BY id DESC LIMIT 1",
+            (host_id, model),
+        ).fetchone()
+        if (last is not None and last["window_idx"] == window_idx
+                and last["predicted_stage"] == predicted_stage and last["source"] == source
+                and abs(last["infiltration_probability"] - float(infiltration_probability)) < 1e-9):
+            return
         conn.execute(
             "INSERT INTO inference_log (host_id, window_idx, created_at, model, predicted_stage, "
             "infiltration_probability, true_stage, state_label, source) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -176,3 +207,36 @@ def stage_breakdown(limit: int = 500):
     for r in rows:
         counts[r["predicted_stage"]] = counts.get(r["predicted_stage"], 0) + 1
     return {"total": total, "counts": counts}
+
+
+def log_tripwire_alert(remote_ip: str, message: str, severity: str, detail: dict) -> dict:
+    """Persists a fast rule-based tripwire alert (see app/live/tripwire.py).
+    Unlike inference_log rows, these are never wiped on capture restart --
+    they're a genuine event log, not per-session state."""
+    created_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO tripwire_alerts (created_at, remote_ip, message, severity, detail_json) VALUES (?,?,?,?,?)",
+            (created_at, remote_ip, message, severity, json.dumps(detail)),
+        )
+        alert_id = cur.lastrowid
+    return {"id": alert_id, "timestamp": created_at, "remote_ip": remote_ip, "message": message, "severity": severity, "detail": detail}
+
+
+def recent_tripwire_alerts(limit: int = 50) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, created_at, remote_ip, message, severity, detail_json FROM tripwire_alerts "
+            "ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [
+        {
+            "id": r["id"],
+            "timestamp": r["created_at"],
+            "remote_ip": r["remote_ip"],
+            "message": r["message"],
+            "severity": r["severity"],
+            "detail": json.loads(r["detail_json"]) if r["detail_json"] else {},
+        }
+        for r in rows
+    ]

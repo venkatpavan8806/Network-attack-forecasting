@@ -13,10 +13,14 @@ from app.config import (
     FEATURE_COLUMNS, SEQ_LEN, ROLLOUT_K, STAGE_CLASSES, IDX_TO_STAGE,
     SYNTHETIC_CSV, DATA_DIR, BENCHMARK_JSON, CALIBRATION_JSON, LEAD_TIME_JSON,
     FALSE_ALARM_JSON, LSTM_WEIGHTS, BASELINE_WEIGHTS, SCALER_WEIGHTS, RANDOM_SEED,
+    STAGE_MEAN_VECTORS_JSON, BRANCH_DEPTH, BRANCH_FACTOR,
 )
 from app.labeling.state_labeler import derive_state_labels
 from app.features.extraction import load_scaler
-from app.models.lstm_world_model import load_model, rollout as lstm_rollout, one_step_forecast
+from app.models.lstm_world_model import (
+    load_model, rollout as lstm_rollout, one_step_forecast,
+    branching_rollout as lstm_branching_rollout, enumerate_paths,
+)
 from app.models.baseline_lr import load_baseline
 from app.models.attack_mapping import map_stage
 from app.explain.attention import explain_prediction
@@ -33,12 +37,36 @@ class ArtifactsNotReadyError(RuntimeError):
     pass
 
 
+def _build_branching_forecast(stage_probs_per_horizon: list[list[float]], top_k: int = 3) -> list[dict]:
+    """Turns the model's raw per-horizon class distributions (already
+    computed inside rollout(), just never exposed before) into a compact
+    top-K structure with real MITRE mapping attached to each candidate --
+    the "branching" next-action forecast: not just the single most-likely
+    action at each future step, but the other plausible ones too."""
+    out = []
+    for h, probs in enumerate(stage_probs_per_horizon, start=1):
+        ranked = sorted(zip(STAGE_CLASSES, probs), key=lambda kv: kv[1], reverse=True)[:top_k]
+        candidates = []
+        for action, p in ranked:
+            m = map_stage(action)
+            candidates.append({
+                "action": action,
+                "probability": round(float(p), 4),
+                "technique_id": m["technique_id"],
+                "technique_name": m["technique_name"],
+                "tactic": m["tactic"],
+            })
+        out.append({"horizon": h, "candidates": candidates})
+    return out
+
+
 class InferenceService:
     def __init__(self):
         self.model = None
         self.baseline = None
         self.scaler = None
         self.labeled_df: pd.DataFrame | None = None
+        self.stage_mean_vectors: dict | None = None
         self.shap_explainer: BaselineShapExplainer | None = None
         self.ready = False
 
@@ -60,6 +88,12 @@ class InferenceService:
             self.labeled_df = derive_state_labels(raw)
         else:
             self.labeled_df = None
+
+        if STAGE_MEAN_VECTORS_JSON.exists():
+            with open(STAGE_MEAN_VECTORS_JSON) as f:
+                self.stage_mean_vectors = json.load(f)
+        else:
+            self.stage_mean_vectors = None
 
         self.shap_explainer = self._build_shap_explainer()
 
@@ -156,12 +190,17 @@ class InferenceService:
                 "horizon_windows": ROLLOUT_K,
                 "infiltration_probs_world_model": [round(p, 4) for p in roll["infiltration_probs"]],
                 "predicted_stage_per_horizon": roll["predicted_stage"],
+                "branching_forecast": _build_branching_forecast(roll["stage_probs"]),
             },
             "true_stage": true_stage,
             "state_label": state_label,
         }
 
     def forecast_demo_host(self, host_id: str, at_window_idx: int | None = None):
+        if host_id.startswith("live:"):
+            if at_window_idx is not None:
+                raise ValueError("at_window_idx is not supported for live hosts -- live capture only keeps the most recent 8 windows, there's no history to rewind to")
+            return self.forecast_live_host(host_id[len("live:"):])
         if self.labeled_df is None:
             raise ArtifactsNotReadyError("no dataset loaded; run app.train first")
         host_df = self.labeled_df[self.labeled_df["host_id"] == host_id]
@@ -172,6 +211,118 @@ class InferenceService:
             if len(host_df) < SEQ_LEN:
                 raise ValueError(f"host '{host_id}' has fewer than {SEQ_LEN} windows at/before window {at_window_idx}")
         return self.forecast_host_from_dataframe(host_id, host_df, log_source="live")
+
+    # -- live-capture hosts: same inference, sourced from the live capture's
+    # own rolling raw-feature history instead of the synthetic demo dataset --
+    def _live_history_raw(self, remote_ip: str) -> tuple[np.ndarray, int]:
+        """Returns (raw_window_array, window_idx) for a live-captured remote
+        host, or raises ValueError with a clear reason if it's not ready."""
+        from app.live.capture import live_capture
+        if not live_capture.running:
+            raise ValueError(f"live capture is not running -- cannot forecast live host '{remote_ip}'")
+        hist = live_capture.history.get(remote_ip)
+        if hist is None or len(hist) < SEQ_LEN:
+            have = 0 if hist is None else len(hist)
+            raise ValueError(f"live host '{remote_ip}' has {have}/{SEQ_LEN} windows of history -- not enough yet")
+        window_idx = live_capture.window_counter.get(remote_ip, len(hist))
+        return np.stack(list(hist)).astype(np.float32), window_idx
+
+    def forecast_live_host(self, remote_ip: str):
+        """Same real inference as forecast_host_from_dataframe (attention +
+        saliency explanation, K-step rollout, branching forecast), sourced
+        from live capture's raw window history instead of the demo dataset.
+        Does not re-log to the inference table -- that already happened once
+        when the window was first processed by app/live/capture.py; this is
+        an on-demand recomputation for the UI, not a new observation."""
+        window_raw, window_idx = self._live_history_raw(remote_ip)
+        window_scaled = self.scaler.transform(window_raw).astype(np.float32)
+        explanation = explain_prediction(self.model, window_scaled)
+        roll = lstm_rollout(self.model, window_scaled, k=ROLLOUT_K)
+        baseline_prob = float(self.baseline.predict_proba(window_scaled[-1:])[0, 1])
+        predicted_stage = max(explanation["stage_probabilities"].items(), key=lambda kv: kv[1])[0]
+        stage_mapping = map_stage(predicted_stage)
+
+        return {
+            "host_id": f"live:{remote_ip}",
+            "window_idx": window_idx,
+            "predicted_stage": predicted_stage,
+            "attack_mapping": stage_mapping,
+            "infiltration_probability_world_model": explanation["infiltration_probability"],
+            "infiltration_probability_baseline": round(baseline_prob, 4),
+            "stage_probabilities": explanation["stage_probabilities"],
+            "explanation": {
+                "attention_over_past_windows": explanation["attention_over_past_windows"],
+                "top_contributors": explanation["top_contributors"],
+            },
+            "rollout": {
+                "horizon_windows": ROLLOUT_K,
+                "infiltration_probs_world_model": [round(p, 4) for p in roll["infiltration_probs"]],
+                "predicted_stage_per_horizon": roll["predicted_stage"],
+                "branching_forecast": _build_branching_forecast(roll["stage_probs"]),
+            },
+            "true_stage": None,
+            "state_label": None,
+        }
+
+    def live_hosts_with_predictions(self) -> list[str]:
+        """Live-captured hosts that have accumulated enough windows to be
+        forecastable/explainable right now (i.e. eligible for Explainability
+        and Digital Twin, not just the Live Capture table's own view)."""
+        from app.live.capture import live_capture
+        if not live_capture.running:
+            return []
+        return [f"live:{ip}" for ip, hist in live_capture.history.items() if len(hist) >= SEQ_LEN]
+
+    def branching_forecast(self, host_id: str, at_window_idx: int | None = None,
+                            depth: int | None = None, branch_factor: int | None = None):
+        """K-step forecast as a branching attack-path TREE (see
+        app/models/lstm_world_model.py:branching_rollout) instead of the
+        single linear path `forecast_demo_host`'s `rollout` block returns.
+        Every node in the tree carries its MITRE ATT&CK mapping, so this is
+        the "K-step + branching + MITRE" forecast: not just "infiltration
+        probability rises over the next K windows" but "here are the
+        distinct plausible attack-technique continuations, each with its
+        own probability, ranked". Demo-dataset hosts only -- live hosts only
+        keep SEQ_LEN windows of raw history, which the linear rollout's own
+        `branching_forecast` field (see _build_branching_forecast above)
+        already covers per-horizon."""
+        if self.labeled_df is None:
+            raise ArtifactsNotReadyError("no dataset loaded; run app.train first")
+        host_df = self.labeled_df[self.labeled_df["host_id"] == host_id]
+        if len(host_df) == 0:
+            raise ValueError(f"unknown host_id: {host_id}")
+        if at_window_idx is not None:
+            host_df = host_df[host_df["window_idx"] <= at_window_idx]
+        host_df = host_df.sort_values("window_idx").reset_index(drop=True)
+        if len(host_df) < SEQ_LEN:
+            raise ValueError(f"host '{host_id}' needs at least {SEQ_LEN} windows, has {len(host_df)}")
+
+        end_pos = len(host_df) - 1
+        window = self._window_sequence(host_df, end_pos)
+        kwargs = {}
+        if depth is not None:
+            kwargs["depth"] = depth
+        if branch_factor is not None:
+            kwargs["branch_factor"] = branch_factor
+        tree = lstm_branching_rollout(self.model, window, stage_mean_vectors=self.stage_mean_vectors, **kwargs)
+        paths = enumerate_paths(tree["root"])
+
+        last_row = host_df.iloc[end_pos]
+        most_likely = paths[0] if paths else None
+        highest_risk = max(paths, key=lambda p: p["final_infiltration_probability"]) if paths else None
+
+        return {
+            "host_id": host_id,
+            "window_idx": int(last_row["window_idx"]),
+            "depth": tree["depth"],
+            "branch_factor": tree["branch_factor"],
+            "tree": tree["root"],
+            "paths": paths,
+            "most_likely_path": most_likely,
+            "highest_risk_path": highest_risk,
+            "true_stage": last_row.get("true_stage"),
+            "state_label": last_row.get("state_label"),
+        }
 
     def ingest_csv(self, df: pd.DataFrame):
         """Parses an uploaded CSV of synthetic-telemetry-shaped rows and runs
@@ -185,29 +336,10 @@ class InferenceService:
         return results
 
     # -- digital twin: model-based counterfactual "what if" -------------
-    def run_counterfactual(self, host_id: str, mitigation_id: str, at_window_idx: int | None = None):
-        """Compares the world model's predicted infiltration trajectory with
-        and without a named mitigation applied, starting from the host's
-        real most-recent observed window (or `at_window_idx`, to replay a
-        specific moment such as "right when brute-force was detected"). Not
-        a live network simulation -- see app/simulation/counterfactual.py."""
-        if self.labeled_df is None:
-            raise ArtifactsNotReadyError("no dataset loaded; run app.train first")
-        host_df = self.labeled_df[self.labeled_df["host_id"] == host_id].sort_values("window_idx").reset_index(drop=True)
-        if len(host_df) == 0:
-            raise ValueError(f"unknown host_id: {host_id}")
-        if at_window_idx is not None:
-            host_df = host_df[host_df["window_idx"] <= at_window_idx].reset_index(drop=True)
-        if len(host_df) < SEQ_LEN:
-            raise ValueError(f"host '{host_id}' needs at least {SEQ_LEN} windows, has {len(host_df)}")
-
+    def _counterfactual_result(self, host_id: str, window_idx: int, mitigation_id: str,
+                                seed_raw: np.ndarray, true_stage=None, state_label=None):
         mitigation_fn = get_mitigation_fn(mitigation_id)
-        end_pos = len(host_df) - 1
-        seed_raw = host_df[FEATURE_COLUMNS].values[end_pos - SEQ_LEN + 1: end_pos + 1].astype(np.float32)
-
-        baseline_roll, mitigated_roll = compare_with_and_without(self.model, self.scaler, seed_raw, mitigation_fn, k=ROLLOUT_K)
-
-        last_row = host_df.iloc[end_pos]
+        baseline_roll, mitigated_roll, metrics = compare_with_and_without(self.model, self.scaler, seed_raw, mitigation_fn, k=ROLLOUT_K)
         mitigations_meta = {m["id"]: m for m in list_mitigations()}
 
         divergences = []
@@ -221,7 +353,7 @@ class InferenceService:
 
         return {
             "host_id": host_id,
-            "window_idx": int(last_row["window_idx"]),
+            "window_idx": window_idx,
             "mitigation": mitigations_meta[mitigation_id],
             "horizon_windows": ROLLOUT_K,
             "without_mitigation": {
@@ -233,9 +365,41 @@ class InferenceService:
                 "predicted_stage_per_horizon": mitigated_roll["predicted_stage"],
             },
             "action_divergences": divergences,
-            "true_stage": last_row.get("true_stage"),
-            "state_label": last_row.get("state_label"),
+            "metrics": metrics,
+            "true_stage": true_stage,
+            "state_label": state_label,
         }
+
+    def run_counterfactual(self, host_id: str, mitigation_id: str, at_window_idx: int | None = None):
+        """Compares the world model's predicted infiltration trajectory with
+        and without a named mitigation applied, starting from the host's
+        real most-recent observed window (or `at_window_idx`, to replay a
+        specific moment such as "right when brute-force was detected"). Not
+        a live network simulation -- see app/simulation/counterfactual.py."""
+        if host_id.startswith("live:"):
+            if at_window_idx is not None:
+                raise ValueError("at_window_idx is not supported for live hosts -- live capture only keeps the most recent 8 windows, there's no history to rewind to")
+            remote_ip = host_id[len("live:"):]
+            seed_raw, window_idx = self._live_history_raw(remote_ip)
+            return self._counterfactual_result(host_id, window_idx, mitigation_id, seed_raw)
+
+        if self.labeled_df is None:
+            raise ArtifactsNotReadyError("no dataset loaded; run app.train first")
+        host_df = self.labeled_df[self.labeled_df["host_id"] == host_id].sort_values("window_idx").reset_index(drop=True)
+        if len(host_df) == 0:
+            raise ValueError(f"unknown host_id: {host_id}")
+        if at_window_idx is not None:
+            host_df = host_df[host_df["window_idx"] <= at_window_idx].reset_index(drop=True)
+        if len(host_df) < SEQ_LEN:
+            raise ValueError(f"host '{host_id}' needs at least {SEQ_LEN} windows, has {len(host_df)}")
+
+        end_pos = len(host_df) - 1
+        seed_raw = host_df[FEATURE_COLUMNS].values[end_pos - SEQ_LEN + 1: end_pos + 1].astype(np.float32)
+        last_row = host_df.iloc[end_pos]
+        return self._counterfactual_result(
+            host_id, int(last_row["window_idx"]), mitigation_id, seed_raw,
+            true_stage=last_row.get("true_stage"), state_label=last_row.get("state_label"),
+        )
 
     def available_mitigations(self):
         return list_mitigations()

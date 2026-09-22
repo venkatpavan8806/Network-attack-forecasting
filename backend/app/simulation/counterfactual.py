@@ -82,6 +82,7 @@ def rollout_counterfactual(model, scaler, seed_raw: np.ndarray, mitigation_fn, k
         predicted_action.append(IDX_TO_ACTION[int(np.argmax(probs))])
 
         next_state_raw = scaler.inverse_transform(next_state.numpy())[0]
+        next_state_raw = _clamp_physical_bounds(next_state_raw)
         next_state_raw = mitigation_fn(next_state_raw)
         next_state_scaled = scaler.transform(next_state_raw.reshape(1, -1))[0].astype(np.float32)
         next_state_t = torch.tensor(next_state_scaled).reshape(1, 1, -1)

@@ -45,6 +45,11 @@ export default function HighestRiskCard({ host, onView }: { host: HighestRiskHos
           MITRE ATT&amp;CK: <span className="font-medium text-[var(--color-ink)]">{host.attack_mapping.technique_id}</span> — {host.attack_mapping.technique_name}
         </div>
       )}
+      {host.attack_mapping?.likely_tools && (
+        <div className="text-xs text-[var(--color-ink-faint)]">
+          Likely tools: {host.attack_mapping.likely_tools}
+        </div>
+      )}
 
       <div className="flex items-center gap-1.5 text-xs text-[var(--color-ink-faint)]">
         <ClockIcon size={13} /> logged {timeAgo}s ago

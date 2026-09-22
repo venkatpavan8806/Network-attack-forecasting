@@ -85,11 +85,32 @@ def hosts():
     return service.list_demo_hosts()
 
 
+@app.get("/live/forecastable-hosts")
+def live_forecastable_hosts():
+    """Live-captured hosts with enough window history (>= SEQ_LEN) to be
+    forecastable right now -- i.e. eligible for Explainability and Digital
+    Twin, not just the Live Capture table's own building-history view."""
+    _require_ready()
+    return service.live_hosts_with_predictions()
+
+
 @app.get("/forecast/{host_id}")
 def forecast(host_id: str, at_window_idx: int | None = None):
     _require_ready()
     try:
         return service.forecast_demo_host(host_id, at_window_idx=at_window_idx)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/forecast/{host_id}/branches")
+def forecast_branches(host_id: str, at_window_idx: int | None = None,
+                       depth: int | None = None, branch_factor: int | None = None):
+    """K-step forecast as a branching attack-path tree, each node MITRE-mapped
+    -- see app/inference/service.py:branching_forecast."""
+    _require_ready()
+    try:
+        return service.branching_forecast(host_id, at_window_idx=at_window_idx, depth=depth, branch_factor=branch_factor)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -313,3 +334,16 @@ def live_alerts(limit: int = 50):
     world model. See app/live/tripwire.py. Complementary to /live/recent,
     which is the slower LSTM forecast that needs real window history."""
     return tripwire.recent(limit=limit)
+
+
+@app.get("/live/packets/{remote_ip}")
+def live_packets(remote_ip: str, limit: int = 100):
+    """Raw, individual packets captured to/from one remote host, most
+    recent first, each with a plain-English description of what it is
+    (SYN/SYN-ACK/RST/FIN/data/ACK). Independent of the window-based
+    aggregate features and of the initiation-direction filter those use --
+    this shows everything actually captured for that IP."""
+    _require_ready()
+    if live_capture.tracker is None:
+        raise HTTPException(status_code=404, detail="live capture is not running")
+    return live_capture.tracker.recent_packets(remote_ip, limit=limit)

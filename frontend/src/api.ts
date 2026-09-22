@@ -3,8 +3,8 @@ import type {
   Kpis, HighestRiskHost, ForecastResponse, ForecastLogRow, StageBreakdown,
   BenchmarkReport, CalibrationReport, LeadTimeReport, FalseAlarmExample,
   SandboxTestResult, AttackMapping, MitigationInfo, CounterfactualResponse,
-  HostTimelineEntry, LiveStatus, LiveWindowEntry, LiveInterface, TripwireAlert,
-  ShapResponse, DefenseAdvice,
+  HostTimelineEntry, LiveStatus, LiveWindowEntry, LiveInterface, TripwireAlert, LivePacket,
+  ShapResponse, DefenseAdvice, BranchingForecastResponse,
 } from './types';
 
 const client = axios.create({ baseURL: '/api' });
@@ -14,9 +14,18 @@ export const api = {
   kpis: () => client.get<Kpis>('/kpis').then((r) => r.data),
   highestRiskHost: () => client.get<HighestRiskHost | null>('/highest-risk-host').then((r) => r.data),
   hosts: () => client.get<string[]>('/hosts').then((r) => r.data),
+  liveForecastableHosts: () => client.get<string[]>('/live/forecastable-hosts').then((r) => r.data),
   hostTimeline: (hostId: string) => client.get<HostTimelineEntry[]>(`/host-timeline/${hostId}`).then((r) => r.data),
   forecast: (hostId: string, atWindowIdx?: number) =>
     client.get<ForecastResponse>(`/forecast/${hostId}`, { params: atWindowIdx != null ? { at_window_idx: atWindowIdx } : {} }).then((r) => r.data),
+  branchingForecast: (hostId: string, atWindowIdx?: number, depth?: number, branchFactor?: number) =>
+    client.get<BranchingForecastResponse>(`/forecast/${hostId}/branches`, {
+      params: {
+        ...(atWindowIdx != null ? { at_window_idx: atWindowIdx } : {}),
+        ...(depth != null ? { depth } : {}),
+        ...(branchFactor != null ? { branch_factor: branchFactor } : {}),
+      },
+    }).then((r) => r.data),
   attackStageBreakdown: () => client.get<StageBreakdown>('/attack-stage-breakdown').then((r) => r.data),
   forecastLog: (limit = 25) => client.get<ForecastLogRow[]>('/forecast-log', { params: { limit } }).then((r) => r.data),
   attackMapping: () => client.get<AttackMapping[]>('/attack-mapping').then((r) => r.data),
@@ -51,6 +60,8 @@ export const api = {
   liveStop: () => client.post<LiveStatus>('/live/stop').then((r) => r.data),
   liveRecent: (limit = 50) => client.get<LiveWindowEntry[]>('/live/recent', { params: { limit } }).then((r) => r.data),
   liveAlerts: (limit = 50) => client.get<TripwireAlert[]>('/live/alerts', { params: { limit } }).then((r) => r.data),
+  livePackets: (remoteIp: string, limit = 100) =>
+    client.get<LivePacket[]>(`/live/packets/${remoteIp}`, { params: { limit } }).then((r) => r.data),
 };
 
 // Colors follow the attack-progression: recon (amber) -> credential access
@@ -81,4 +92,19 @@ export const STAGE_LABELS: Record<string, string> = {
   smb_lateral_movement: 'SMB Lateral Movement',
   c2_beacon: 'C2 Beaconing',
   data_exfiltration: 'Data Exfiltration',
+};
+
+// compact labels for space-constrained diagram nodes
+export const STAGE_SHORT_LABELS: Record<string, string> = {
+  benign: 'Benign',
+  ambiguous_pre_attack: 'Ambig.',
+  port_scan: 'Scan',
+  ssh_bruteforce: 'SSH-BF',
+  rdp_bruteforce: 'RDP-BF',
+  smb_bruteforce: 'SMB-BF',
+  ssh_lateral_movement: 'SSH-Lat',
+  rdp_lateral_movement: 'RDP-Lat',
+  smb_lateral_movement: 'SMB-Lat',
+  c2_beacon: 'C2',
+  data_exfiltration: 'Exfil',
 };

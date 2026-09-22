@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { api, STAGE_COLORS, STAGE_LABELS } from '../api';
 import type { LiveInterface, LiveStatus, LiveWindowEntry } from '../types';
 import CardHeader from '../components/CardHeader';
 import AlertFeed from './AlertFeed';
 import LiveTrajectoryChart, { type LiveTrajectoryPoint } from './LiveTrajectoryChart';
-import { RadarIcon } from '../icons';
+import PacketLogPanel from './PacketLogPanel';
 
 const SEQ_LEN = 8; // must match backend app.config.SEQ_LEN
 
@@ -24,6 +24,7 @@ export default function LiveCapturePanel() {
   const [error, setError] = useState<string | null>(null);
   const [graphHost, setGraphHost] = useState<string | null>(null);
   const [showAll, setShowAll] = useState(false);
+  const [expandedHost, setExpandedHost] = useState<string | null>(null);
   const pollRef = useRef<number | null>(null);
   const autoStartAttempted = useRef(false);
 
@@ -238,32 +239,52 @@ export default function LiveCapturePanel() {
               {visibleRows.map((row) => {
                 const r = row.latest;
                 const hasPrediction = r.predicted_stage != null;
+                const ip = row.hostId.replace('live:', '');
+                const isExpanded = expandedHost === row.hostId;
                 return (
-                  <tr key={row.hostId} className="border-t border-[var(--color-accent-soft)]">
-                    <td className="py-2.5 pr-4 font-medium text-[var(--color-ink)]">{row.hostId.replace('live:', '')}</td>
-                    <td className="py-2.5 pr-4 text-[var(--color-ink-dim)]">
-                      {hasPrediction ? `window ${r.window_idx}` : `${Math.min(row.windowCount, SEQ_LEN)}/${SEQ_LEN} windows`}
-                    </td>
-                    <td className="py-2.5 pr-4">
-                      {hasPrediction ? (
-                        <span className="flex items-center gap-1.5">
-                          <span className="w-1.5 h-1.5 rounded-full" style={{ background: STAGE_COLORS[r.predicted_stage!] ?? '#999' }} />
-                          {STAGE_LABELS[r.predicted_stage!] ?? r.predicted_stage}
-                        </span>
-                      ) : (
-                        <span className="text-[var(--color-ink-faint)]">building history…</span>
-                      )}
-                    </td>
-                    <td className="py-2.5 pr-4 font-semibold text-[var(--color-ink)]">
-                      {r.infiltration_probability_world_model != null ? `${(r.infiltration_probability_world_model * 100).toFixed(1)}%` : '—'}
-                    </td>
-                    <td className="py-2.5 pr-4 text-xs text-[var(--color-ink-dim)]">
-                      {row.allPorts.size > 0 ? Array.from(row.allPorts).sort((a, b) => a - b).join(', ') : '—'}
-                    </td>
-                    <td className="py-2.5 pr-4 text-xs text-[var(--color-ink-dim)] whitespace-nowrap">
-                      {formatTimestamp(r.timestamp)}
-                    </td>
-                  </tr>
+                  <Fragment key={row.hostId}>
+                    <tr className="border-t border-[var(--color-accent-soft)]">
+                      <td className="py-2.5 pr-4 font-medium">
+                        <button
+                          onClick={() => setExpandedHost(isExpanded ? null : row.hostId)}
+                          className="text-[var(--color-accent)] hover:underline flex items-center gap-1"
+                          title="Click to see individual packets from this host"
+                        >
+                          {ip}
+                          <span className="text-[10px] text-[var(--color-ink-faint)]">{isExpanded ? '▲' : '▼'}</span>
+                        </button>
+                      </td>
+                      <td className="py-2.5 pr-4 text-[var(--color-ink-dim)]">
+                        {hasPrediction ? `window ${r.window_idx}` : `${Math.min(row.windowCount, SEQ_LEN)}/${SEQ_LEN} windows`}
+                      </td>
+                      <td className="py-2.5 pr-4">
+                        {hasPrediction ? (
+                          <span className="flex items-center gap-1.5">
+                            <span className="w-1.5 h-1.5 rounded-full" style={{ background: STAGE_COLORS[r.predicted_stage!] ?? '#999' }} />
+                            {STAGE_LABELS[r.predicted_stage!] ?? r.predicted_stage}
+                          </span>
+                        ) : (
+                          <span className="text-[var(--color-ink-faint)]">building history…</span>
+                        )}
+                      </td>
+                      <td className="py-2.5 pr-4 font-semibold text-[var(--color-ink)]">
+                        {r.infiltration_probability_world_model != null ? `${(r.infiltration_probability_world_model * 100).toFixed(1)}%` : '—'}
+                      </td>
+                      <td className="py-2.5 pr-4 text-xs text-[var(--color-ink-dim)]">
+                        {row.allPorts.size > 0 ? Array.from(row.allPorts).sort((a, b) => a - b).join(', ') : '—'}
+                      </td>
+                      <td className="py-2.5 pr-4 text-xs text-[var(--color-ink-dim)] whitespace-nowrap">
+                        {formatTimestamp(r.timestamp)}
+                      </td>
+                    </tr>
+                    {isExpanded && (
+                      <tr>
+                        <td colSpan={6} className="pb-3">
+                          <PacketLogPanel remoteIp={ip} />
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
                 );
               })}
             </tbody>

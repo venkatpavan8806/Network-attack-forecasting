@@ -58,3 +58,37 @@ def test_highest_risk_picks_the_highest_probability_among_fresh_hosts(isolated_d
     _log_at("live:2.2.2.2", 0.85, minutes_ago=1, source="live_capture")
     result = db.highest_risk_host()
     assert result["host_id"] == "live:2.2.2.2"
+
+
+def _count_rows(host_id: str) -> int:
+    with db.get_conn() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) as c FROM inference_log WHERE host_id = ?", (host_id,)
+        ).fetchone()["c"]
+
+
+def test_log_inference_skips_exact_repeat_for_same_host_and_model(isolated_db):
+    """A demo host's prediction is deterministic, so re-polling the same
+    window (e.g. Overview's 10s refresh) must not spam the log."""
+    for _ in range(3):
+        db.log_inference("attack-host-000", 129, "world_model_lstm", "benign", 0.42, source="live")
+    assert _count_rows("attack-host-000") == 1
+
+
+def test_log_inference_does_not_skip_across_different_models(isolated_db):
+    """Regression guard: one forecast call logs both world_model_lstm AND
+    baseline_logreg rows for the same window. Comparing a new row only
+    against the single most recent row (rather than the most recent row for
+    the SAME model) would see the other model's row and never match, so
+    every poll would still insert a fresh duplicate pair -- this is exactly
+    what shipped and was caught by hand in the browser, not by a test."""
+    for _ in range(3):
+        db.log_inference("attack-host-000", 129, "world_model_lstm", "benign", 0.42, source="live")
+        db.log_inference("attack-host-000", 129, "baseline_logreg", None, 0.0, source="live")
+    assert _count_rows("attack-host-000") == 2  # one world_model_lstm row, one baseline_logreg row
+
+
+def test_log_inference_does_not_skip_a_genuinely_new_window(isolated_db):
+    db.log_inference("attack-host-000", 74, "world_model_lstm", "data_exfiltration", 0.999, source="live")
+    db.log_inference("attack-host-000", 129, "world_model_lstm", "benign", 0.42, source="live")
+    assert _count_rows("attack-host-000") == 2

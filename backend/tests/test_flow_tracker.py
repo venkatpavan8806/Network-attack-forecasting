@@ -1,5 +1,5 @@
 from app.config import FEATURE_COLUMNS
-from app.live.flow_tracker import FlowTracker
+from app.live.flow_tracker import FlowTracker, PacketRecord, describe_packet, PACKET_LOG_MAXLEN
 
 
 def test_empty_window_returns_no_hosts():
@@ -161,3 +161,86 @@ def test_window_clears_after_roll():
                         flags="S", ttl=64, win_size=1024, pkt_len=60, ts=0.0)
     tracker.roll_window()
     assert tracker.roll_window() == {}
+
+
+def _rec(**overrides):
+    base = dict(ts=0.0, direction="in", local_port=22, remote_port=1000, flags="S", ttl=64, win_size=1024, pkt_len=60)
+    base.update(overrides)
+    return PacketRecord(**base)
+
+
+def test_describe_packet_syn():
+    desc = describe_packet(_rec(flags="S", direction="in", local_port=22))
+    assert "SYN" in desc
+    assert "them" in desc.lower()
+    assert "[SSH]" in desc
+
+
+def test_describe_packet_syn_ack():
+    desc = describe_packet(_rec(flags="SA"))
+    assert "SYN-ACK" in desc
+
+
+def test_describe_packet_rst():
+    desc = describe_packet(_rec(flags="R"))
+    assert "reset" in desc.lower() or "refused" in desc.lower()
+
+
+def test_describe_packet_fin():
+    desc = describe_packet(_rec(flags="F"))
+    assert "closing" in desc.lower()
+
+
+def test_describe_packet_data_transfer_includes_byte_count():
+    desc = describe_packet(_rec(flags="PA", pkt_len=1400))
+    assert "1400 bytes" in desc
+
+
+def test_describe_packet_unwatched_port_has_no_service_tag():
+    desc = describe_packet(_rec(local_port=8080, direction="in"))
+    assert "[" not in desc
+
+
+def test_recent_packets_survives_window_rollover():
+    """Unlike the aggregate window features, the raw packet log must NOT be
+    cleared when a window rolls over -- it's for independent inspection."""
+    tracker = FlowTracker(local_ip="10.0.0.5")
+    tracker.ingest_tcp(remote_ip="10.0.0.9", direction="in", local_port=22, remote_port=1000,
+                        flags="S", ttl=64, win_size=1024, pkt_len=60, ts=1.0)
+    tracker.roll_window()
+    packets = tracker.recent_packets("10.0.0.9")
+    assert len(packets) == 1
+    assert packets[0]["description"]
+    assert packets[0]["local_port"] == 22
+
+
+def test_recent_packets_newest_first():
+    tracker = FlowTracker(local_ip="10.0.0.5")
+    tracker.ingest_tcp(remote_ip="10.0.0.9", direction="in", local_port=22, remote_port=1000,
+                        flags="S", ttl=64, win_size=1024, pkt_len=60, ts=1.0)
+    tracker.ingest_tcp(remote_ip="10.0.0.9", direction="in", local_port=445, remote_port=1001,
+                        flags="S", ttl=64, win_size=1024, pkt_len=60, ts=2.0)
+    packets = tracker.recent_packets("10.0.0.9")
+    assert packets[0]["local_port"] == 445
+    assert packets[1]["local_port"] == 22
+
+
+def test_recent_packets_unknown_host_returns_empty():
+    tracker = FlowTracker(local_ip="10.0.0.5")
+    assert tracker.recent_packets("9.9.9.9") == []
+
+
+def test_recent_packets_respects_limit():
+    tracker = FlowTracker(local_ip="10.0.0.5")
+    for i in range(10):
+        tracker.ingest_tcp(remote_ip="10.0.0.9", direction="in", local_port=1000 + i, remote_port=2000,
+                            flags="S", ttl=64, win_size=1024, pkt_len=60, ts=float(i))
+    assert len(tracker.recent_packets("10.0.0.9", limit=3)) == 3
+
+
+def test_packet_log_is_capped():
+    tracker = FlowTracker(local_ip="10.0.0.5")
+    for i in range(PACKET_LOG_MAXLEN + 50):
+        tracker.ingest_tcp(remote_ip="10.0.0.9", direction="in", local_port=1000, remote_port=2000,
+                            flags="A", ttl=64, win_size=1024, pkt_len=60, ts=float(i))
+    assert len(tracker.recent_packets("10.0.0.9", limit=PACKET_LOG_MAXLEN + 100)) == PACKET_LOG_MAXLEN

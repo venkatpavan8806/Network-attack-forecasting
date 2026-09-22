@@ -30,3 +30,28 @@ def test_ambiguous_pre_attack_maps_to_pre_confirmation_tactic():
 def test_unknown_stage_raises():
     with pytest.raises(ValueError):
         map_stage("not_a_real_stage")
+
+
+def test_every_malicious_action_has_tools_and_system_state():
+    from app.config import MALICIOUS_HARD_ACTIONS
+    for action in MALICIOUS_HARD_ACTIONS:
+        m = map_stage(action)
+        assert m["likely_tools"], f"{action} missing likely_tools"
+        assert m["likely_system_state"], f"{action} missing likely_system_state"
+
+
+def test_benign_has_no_tools():
+    m = map_stage("benign")
+    assert m["likely_tools"] is None
+
+
+def test_ssh_bruteforce_tools_mention_known_tools():
+    m = map_stage("ssh_bruteforce")
+    assert "Hydra" in m["likely_tools"]
+
+
+def test_system_state_describes_consequence_not_just_label():
+    """The system-state text should describe an actual consequence, not
+    just restate the action name."""
+    m = map_stage("c2_beacon")
+    assert "command-and-control" in m["likely_system_state"].lower() or "control" in m["likely_system_state"].lower()

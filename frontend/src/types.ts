@@ -10,6 +10,8 @@ export interface AttackMapping {
   technique_id: string | null;
   technique_name: string;
   tactic: string;
+  likely_tools: string | null;
+  likely_system_state: string | null;
 }
 
 export interface HighestRiskHost {
@@ -29,6 +31,19 @@ export interface TopContributor {
   contribution_score: number;
 }
 
+export interface BranchingCandidate {
+  action: string;
+  probability: number;
+  technique_id: string | null;
+  technique_name: string;
+  tactic: string;
+}
+
+export interface BranchingHorizon {
+  horizon: number;
+  candidates: BranchingCandidate[];
+}
+
 export interface ForecastResponse {
   host_id: string;
   window_idx: number;
@@ -45,6 +60,7 @@ export interface ForecastResponse {
     horizon_windows: number;
     infiltration_probs_world_model: number[];
     predicted_stage_per_horizon: string[];
+    branching_forecast: BranchingHorizon[];
   };
   true_stage: string | null;
   state_label: string | null;
@@ -144,6 +160,36 @@ export interface HostTimelineEntry {
   state_label: string;
 }
 
+export interface BranchNode {
+  stage: string | null;
+  step_probability: number | null;
+  path_probability: number;
+  infiltration_probability: number | null;
+  attack_mapping: AttackMapping | null;
+  depth: number;
+  children: BranchNode[];
+}
+
+export interface BranchPath {
+  stages: string[];
+  path_probability: number;
+  final_infiltration_probability: number;
+  mitre_kill_chain: (AttackMapping & { stage: string })[];
+}
+
+export interface BranchingForecastResponse {
+  host_id: string;
+  window_idx: number;
+  depth: number;
+  branch_factor: number;
+  tree: BranchNode;
+  paths: BranchPath[];
+  most_likely_path: BranchPath | null;
+  highest_risk_path: BranchPath | null;
+  true_stage: string | null;
+  state_label: string | null;
+}
+
 export interface MitigationInfo {
   id: string;
   label: string;
@@ -161,6 +207,15 @@ export interface ActionDivergence {
   with_mitigation_action: string;
 }
 
+export interface CounterfactualMetrics {
+  mean_without: number;
+  mean_with: number;
+  peak_risk_without: number;
+  peak_risk_with: number;
+  risk_reduction_pct: number;
+  verdict: string;
+}
+
 export interface CounterfactualResponse {
   host_id: string;
   window_idx: number;
@@ -169,6 +224,7 @@ export interface CounterfactualResponse {
   without_mitigation: CounterfactualScenario;
   with_mitigation: CounterfactualScenario;
   action_divergences: ActionDivergence[];
+  metrics: CounterfactualMetrics;
   true_stage: string | null;
   state_label: string | null;
 }
@@ -187,6 +243,18 @@ export interface LiveStatus {
   packets_seen: number;
   hosts_seen: number;
   error: string | null;
+}
+
+export interface LivePacket {
+  timestamp: number;
+  direction: 'in' | 'out';
+  local_port: number;
+  remote_port: number;
+  flags: string;
+  ttl: number;
+  win_size: number;
+  pkt_len: number;
+  description: string;
 }
 
 export interface TripwireAlert {
