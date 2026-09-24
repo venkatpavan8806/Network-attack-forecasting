@@ -249,6 +249,10 @@ def main():
     print("\n== building recent forecast log for UI ==")
     build_recent_forecast_log(lstm_model, baseline_clf, scaler, labeled, test_hosts)
 
+    print("\n== step-by-step tracking + next 1/2/3-move evaluation ==")
+    from app.evaluate_step_tracking import main as evaluate_step_tracking
+    evaluate_step_tracking()
+
     print(f"\nTotal training pipeline time: {time.time() - t0:.1f}s")
 
 

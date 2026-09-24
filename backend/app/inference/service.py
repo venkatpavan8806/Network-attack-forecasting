@@ -29,6 +29,8 @@ from app.defense.advisor import build_advice
 from app.simulation.mitigations import get_mitigation_fn, list_mitigations
 from app.simulation.counterfactual import compare_with_and_without, rollout_counterfactual
 from app import db
+from app.models.ngram_move_model import NGramMoveModel, NGRAM_MODEL_JSON, labels_to_moves
+from app.tracking.step_tracker import track_host
 
 SHAP_BACKGROUND_SIZE = 200  # normal-traffic windows used as SHAP's reference point
 
@@ -68,6 +70,7 @@ class InferenceService:
         self.labeled_df: pd.DataFrame | None = None
         self.stage_mean_vectors: dict | None = None
         self.shap_explainer: BaselineShapExplainer | None = None
+        self.ngram: NGramMoveModel | None = None
         self.ready = False
 
     def load(self):
@@ -96,6 +99,7 @@ class InferenceService:
             self.stage_mean_vectors = None
 
         self.shap_explainer = self._build_shap_explainer()
+        self.ngram = self._load_ngram()
 
         db.init_db()
         db.seed_from_training_log()
@@ -113,6 +117,19 @@ class InferenceService:
         sample = normal.sample(n=min(SHAP_BACKGROUND_SIZE, len(normal)), random_state=RANDOM_SEED)
         background = self.scaler.transform(sample[FEATURE_COLUMNS].values)
         return BaselineShapExplainer(self.baseline, background)
+
+    def _load_ngram(self) -> NGramMoveModel | None:
+        """Next-1/2/3-move model. Written by app.evaluate_step_tracking; if it
+        is missing, fit it on the loaded dataset's attack hosts so the step
+        tracker still works (it is a cheap counting model)."""
+        if NGRAM_MODEL_JSON.exists():
+            return NGramMoveModel.load()
+        if self.labeled_df is None:
+            return None
+        seqs = [labels_to_moves(g.sort_values("window_idx")["state_label"], add_end=True)
+                for _, g in self.labeled_df.groupby("host_id")]
+        seqs = [s for s in seqs if s]
+        return NGramMoveModel(order=3).fit(seqs) if seqs else None
 
     # -- validation -----------------------------------------------------
     def validate_telemetry_csv(self, df: pd.DataFrame) -> list[str]:
@@ -504,6 +521,41 @@ class InferenceService:
             [round(p, 4) for p in mitigated[rec["id"]]["infiltration_probs"]] if rec else None
         )
         return advice
+
+    # -- step-by-step attacker tracking (prediction after EVERY window) ----
+    def track_attacker(self, host_id: str, at_window_idx: int | None = None):
+        """Walks the host's timeline from its FIRST window and predicts the
+        attacker's next step after each one -- no SEQ_LEN warm-up gap (see
+        app/tracking/step_tracker.py). Works for demo/CSV hosts and for
+        `live:<ip>` hosts (from the live capture's full window history)."""
+        if host_id.startswith("live:"):
+            from app.live.capture import live_capture
+            remote_ip = host_id[len("live:"):]
+            rows = live_capture.full_history.get(remote_ip)
+            if not rows:
+                raise ValueError(f"unknown host_id: {host_id} (not seen by the live capture)")
+            raw = np.stack(rows).astype(np.float32)
+            widx = list(range(1, len(rows) + 1))
+            labels = None
+        else:
+            if self.labeled_df is None:
+                raise ArtifactsNotReadyError("no dataset loaded; run app.train first")
+            host_df = self.labeled_df[self.labeled_df["host_id"] == host_id].sort_values("window_idx")
+            if len(host_df) == 0:
+                raise ValueError(f"unknown host_id: {host_id}")
+            if at_window_idx is not None:
+                host_df = host_df[host_df["window_idx"] <= at_window_idx]
+            raw = host_df[FEATURE_COLUMNS].values
+            widx = host_df["window_idx"].astype(int).tolist()
+            labels = host_df["state_label"].tolist() if "state_label" in host_df.columns else None
+        feats = self.scaler.transform(raw).astype(np.float32)
+        result = track_host(self.model, feats, widx, labels=labels, ngram=self.ngram)
+        result["host_id"] = host_id
+        return result
+
+    def step_tracking_report(self):
+        from app.evaluate_step_tracking import STEP_TRACKING_JSON
+        return self.load_report(STEP_TRACKING_JSON)
 
     # -- precomputed reports ---------------------------------------------
     def load_report(self, path):

@@ -209,6 +209,76 @@ kill-chain. `backend/tests/test_lstm.py` covers tree shape/depth/pruning and
 that branches genuinely condition on the chosen action (not just cosmetically
 labeled).
 
+## Step-by-step attacker tracking (a prediction after every window)
+
+`backend/app/tracking/step_tracker.py`, `GET /track/{host_id}`, the
+"Step-by-Step Attacker Tracking" card on the Forecasts page.
+
+**1. From window 1, not window 8.** The forecast above needs `SEQ_LEN = 8`
+windows before it says anything. The tracker walks a host's timeline from
+its first window and predicts the next window after every one, keeping a
+running track of the attack so far. For windows 1–7 (warm-up), the missing
+history is filled by repeating the earliest window. The model is not
+retrained for this, and warm-up predictions are flagged and scored
+separately. Live capture now also predicts from the first window of a new
+IP (`warmup: true` in `/live/recent`). The **attack path so far** is built
+from the model's own predictions, so it also works on live traffic:
+
+- A move counts once it is the top prediction for 2 windows in a row.
+- A different variant in the same kill-chain phase (for example SSH, then
+  RDP brute-force) replaces the last move.
+- Skipping a phase needs twice as many confirming windows.
+
+**2. The metric behind each prediction.**
+
+- **Predicted next action:** `argmax_a P(a | windows 1..t)` from the LSTM
+  softmax.
+- **Confidence:** that winning probability.
+- **Alert:** infiltration probability `1 − P(benign) ≥ 0.5`.
+
+Tracking quality is measured with top-1 and top-3 accuracy, macro-F1 and
+accuracy at phase changes. The next 1, 2 or 3 moves are scored with
+exact-sequence match, at both technique and tactic level.
+
+**3. Predicting 2 or 3 moves ahead: other algorithms.** An attack is a
+sequence of distinct **moves** (consecutive windows with the same action
+merged). Predicting the next 2 or 3 moves works like next-word prediction
+in language modelling, so `backend/app/models/ngram_move_model.py` adds an
+**n-gram / Markov-chain model** over moves: `P(m_{i+1} | m_{i-1}, m_i)`
+with interpolated smoothing, and beam search for 2–3 moves ahead. The
+n-gram knows the attack grammar but can't see traffic, so it can't tell
+which service comes next. The **hybrid** multiplies in the LSTM's traffic
+evidence for the first move. Other suitable algorithms, not implemented
+here: HMMs, which infer hidden attack phases from noisy observations;
+Transformer or GRU seq2seq decoders, which output multi-step sequences and
+need more data; attack graphs or Bayesian networks, which encode which
+exploit enables which next step.
+
+Held-out attack hosts, from this run's `data/step_tracking_report.json`
+(`python -m app.evaluate_step_tracking`, also called at the end of
+`app.train`):
+
+| Method | next 1 move | next 2 | next 3 | next 3 (tactic only) |
+|---|---|---|---|---|
+| Markov chain (order 1) | 61.6 % | 48.6 % | 27.7 % | 100 % |
+| N-gram (trigram) | 61.6 % | 48.6 % | 27.7 % | 100 % |
+| LSTM only | 37.6 % | n/a | n/a | n/a |
+| **Trigram + LSTM hybrid** | **64.6 %** | 48.6 % | 27.7 % | 100 % |
+
+Per-window tracking on held-out hosts:
+
+- Top-1 accuracy 91.4 %, top-3 accuracy 98.1 %.
+- Warm-up windows 1–7: 94.6 %.
+- Cold start, where the attacker is first seen at window 1: 64.3 %.
+- Attack-path order, at tactic level: correct on 19/19 attack hosts.
+  Exact SSH/RDP/SMB variant: 26 %. The existing LSTM often confuses the
+  service variant, and that limits the technique-level results.
+
+Trigram and first-order Markov score the same because the synthetic attack
+script is itself first-order. On real multi-branch attacks the higher order
+should matter more. There are only 4 held-out attack hosts, so treat these
+numbers as indicative.
+
 ## Explainability
 
 **Primary (LSTM):** the attention weights above (which past real windows the
@@ -353,6 +423,11 @@ FastAPI app (`app/api/main.py`), fully offline:
   explanation for a demo host
 - `GET /forecast/{host_id}/branches` — K-step forecast as a branching
   MITRE-mapped attack-path tree (see "Branching K-step forecast" above)
+- `GET /track/{host_id}` — step-by-step attacker tracking: a next-step
+  prediction after every window from window 1, the attack path so far, and
+  the next 1/2/3 moves (demo hosts and `live:<ip>` hosts)
+- `GET /step-tracking-report` — tracking accuracy + next-1/2/3-move
+  comparison (Markov / trigram / LSTM / hybrid)
 - `POST /sandbox/test` — genuinely validates an uploaded CSV and returns
   `outcome: "failure"` with specific reasons when the input actually is
   malformed (missing columns, non-numeric values, too few windows per host)

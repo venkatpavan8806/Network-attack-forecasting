@@ -115,6 +115,29 @@ def forecast_branches(host_id: str, at_window_idx: int | None = None,
         raise HTTPException(status_code=404, detail=str(e))
 
 
+@app.get("/track/{host_id}")
+def track_attacker(host_id: str, at_window_idx: int | None = None):
+    """Step-by-step attacker tracking: a next-step prediction after EVERY
+    window from the host's first one, the attack path recognised so far, and
+    the next 1/2/3 moves -- see app/tracking/step_tracker.py."""
+    _require_ready()
+    try:
+        return service.track_attacker(host_id, at_window_idx=at_window_idx)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/step-tracking-report")
+def step_tracking_report():
+    """Accuracy of step-by-step tracking + next-1/2/3-move comparison
+    (Markov / trigram / LSTM / hybrid). Written by app.evaluate_step_tracking."""
+    _require_ready()
+    r = service.step_tracking_report()
+    if r is None:
+        raise HTTPException(status_code=404, detail="step tracking report not computed yet -- run `python -m app.evaluate_step_tracking`")
+    return r
+
+
 @app.get("/host-timeline/{host_id}")
 def host_timeline(host_id: str):
     """Windows + ground-truth action for one host -- lets the UI offer
