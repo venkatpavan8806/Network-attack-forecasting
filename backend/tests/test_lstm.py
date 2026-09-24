@@ -4,7 +4,7 @@ import torch
 from app.config import N_FEATURES, SEQ_LEN, STAGE_CLASSES
 from app.models.lstm_world_model import (
     LSTMWorldModel, infiltration_probability, rollout, one_step_forecast, input_gradient_saliency,
-    branching_rollout, enumerate_paths,
+    branching_rollout, enumerate_paths, save_model, load_model,
 )
 
 
@@ -133,3 +133,29 @@ def test_enumerate_paths_sorted_by_probability_descending():
         assert len(p["stages"]) == 2
         assert len(p["mitre_kill_chain"]) == 2
         assert all("technique_id" in m for m in p["mitre_kill_chain"])
+
+
+def test_save_and_load_model_at_custom_paths_does_not_touch_the_default_ones(tmp_path):
+    """The versioning gate in app/train.py saves a regressed candidate model
+    to a separate path instead of overwriting the live one -- this is the
+    parameterization that makes that possible."""
+    model = _dummy_model()
+    weights_path = tmp_path / "candidate.pt"
+    meta_path = tmp_path / "candidate_meta.json"
+
+    save_model(model, hidden_size=8, num_layers=1, weights_path=weights_path, meta_path=meta_path)
+
+    assert weights_path.exists()
+    assert meta_path.exists()
+    from app.config import LSTM_WEIGHTS, LSTM_META
+    assert not (weights_path == LSTM_WEIGHTS or meta_path == LSTM_META)
+
+    reloaded = load_model(weights_path=weights_path, meta_path=meta_path)
+    model.eval()  # load_model() always returns eval mode; compare like-for-like (train-mode
+    # BatchNorm uses per-batch statistics and would differ from the reloaded model for reasons
+    # that have nothing to do with whether the weights actually round-tripped correctly)
+    x = torch.randn(2, SEQ_LEN, N_FEATURES)
+    with torch.no_grad():
+        original_logits, _, _ = model(x)
+        reloaded_logits, _, _ = reloaded(x)
+    assert torch.allclose(original_logits, reloaded_logits, atol=1e-6)

@@ -19,6 +19,7 @@ Produces (all real, computed from this run -- see config.py for exact paths):
 """
 from __future__ import annotations
 
+import argparse
 import json
 import time
 
@@ -32,7 +33,8 @@ from torch.utils.data import TensorDataset, DataLoader
 from app.config import (
     RANDOM_SEED, SYNTHETIC_CSV, DATA_DIR, SEQ_LEN, N_FEATURES, STAGE_CLASSES,
     STAGE_TO_IDX, IDX_TO_STAGE, MALICIOUS_HARD_STAGES, FORECAST_LOG_JSON,
-    FEATURE_COLUMNS, STAGE_MEAN_VECTORS_JSON,
+    FEATURE_COLUMNS, STAGE_MEAN_VECTORS_JSON, LSTM_WEIGHTS, LSTM_META, BENCHMARK_JSON,
+    CANDIDATE_LSTM_WEIGHTS, CANDIDATE_LSTM_META, CANDIDATE_BENCHMARK_JSON, LSTM_REGRESSION_TOLERANCE,
 )
 from app.data_gen.generator import generate_dataset
 from app.labeling.state_labeler import derive_state_labels, build_transition_pairs
@@ -45,6 +47,7 @@ from app.evaluation.metrics import run_full_benchmark
 from app.evaluation.calibration import compute_calibration
 from app.evaluation.lead_time import compute_lead_time
 from app.evaluation.false_alarms import find_false_alarms
+from app.evaluation.threshold_tuning import calibrate_and_report
 from app.models.attack_mapping import map_stage
 
 torch.manual_seed(RANDOM_SEED)
@@ -175,8 +178,41 @@ def build_stage_mean_vectors(labeled_df, scaler, train_hosts) -> dict:
     return vectors
 
 
-def main():
+def _load_live_lstm_f1() -> float | None:
+    """The currently-LIVE model's F1 (world_model_lstm), read from its own
+    benchmark_report.json before this run overwrites anything. None means
+    "nothing to compare against" (fresh checkout, or a benchmark report from
+    before this field existed) -- the new model is always promoted in that
+    case, same as every run before this gate existed."""
+    if not LSTM_WEIGHTS.exists() or not BENCHMARK_JSON.exists():
+        return None
+    try:
+        with open(BENCHMARK_JSON) as f:
+            return json.load(f)["world_model_lstm"]["f1"]
+    except (KeyError, json.JSONDecodeError):
+        return None
+
+
+def should_promote(new_f1: float, live_f1: float | None, force: bool = False,
+                    tolerance: float = LSTM_REGRESSION_TOLERANCE) -> bool:
+    """True if a newly-trained LSTM should replace the currently-live one.
+    Pulled out as a pure function (no I/O) so the gate's actual decision
+    logic is unit-testable without running a real training pass -- see
+    tests/test_train_versioning.py. Always promotes when there is nothing to
+    compare against (fresh checkout) or `force` is set; otherwise only when
+    the new F1 doesn't fall more than `tolerance` below the live one. This is
+    exactly the check that would have caught this project's own CNN+BiLSTM
+    architecture shipping a regression (F1 0.970 vs. the prior 0.994) without
+    anyone noticing until a benchmark run was read by hand."""
+    if live_f1 is None or force:
+        return True
+    return new_f1 >= live_f1 - tolerance
+
+
+def main(force: bool = False):
     t0 = time.time()
+    live_f1 = _load_live_lstm_f1()  # read BEFORE this run overwrites anything, so it stays the true "before" number
+
     print("== generating synthetic dataset ==")
     raw = generate_dataset(seed=RANDOM_SEED)
     raw.to_csv(SYNTHETIC_CSV, index=False)
@@ -206,8 +242,17 @@ def main():
     print(f"stage_mean_vectors.json: {len(stage_means)}/{len(STAGE_CLASSES)} action classes covered")
 
     print("\n== building LSTM sequences ==")
-    X_train, y_stage_train, y_next_train, y_cur_train, meta_train = build_sequences(labeled, scaler, train_hosts)
-    X_val, y_stage_val, y_next_val, y_cur_val, meta_val = build_sequences(labeled, scaler, val_hosts)
+    # include_warmup=True for train/val: the model is also trained and
+    # validated on left-padded, fewer-than-SEQ_LEN-real-windows inputs, so it
+    # actually learns the warm-up case (app/tracking/step_tracker.py serves
+    # this to users from window 1) instead of only ever seeing it for the
+    # first time at inference. Test stays full-history-only (include_warmup
+    # default False) so the reported benchmark F1 keeps its existing,
+    # already-documented meaning and isn't silently redefined.
+    X_train, y_stage_train, y_next_train, y_cur_train, meta_train = build_sequences(
+        labeled, scaler, train_hosts, include_warmup=True)
+    X_val, y_stage_val, y_next_val, y_cur_val, meta_val = build_sequences(
+        labeled, scaler, val_hosts, include_warmup=True)
     X_test, y_stage_test, y_next_test, y_cur_test, meta_test = build_sequences(labeled, scaler, test_hosts)
     print(f"train sequences: {X_train.shape}  val: {X_val.shape}  test: {X_test.shape}")
 
@@ -215,7 +260,6 @@ def main():
     lstm_model, hidden_size, num_layers = train_lstm(
         X_train, y_stage_train, y_next_train, X_val, y_stage_val, y_next_val,
     )
-    save_model(lstm_model, hidden_size, num_layers)
 
     print("\n== training logistic regression baseline ==")
     X_base_train, y_base_train, meta_base_train = build_single_window_table(labeled, scaler, train_hosts)
@@ -230,8 +274,35 @@ def main():
         1 if labeled_idx.loc[(m["host_id"], m["window_idx_next"]), "true_stage"] in MALICIOUS_HARD_STAGES else 0
         for m in meta_test
     ])
-    report = run_full_benchmark(baseline_clf, lstm_model, X_base_test, y_base_test, X_test, y_true_hard_at_w)
+    report = run_full_benchmark(baseline_clf, lstm_model, X_base_test, y_base_test, X_test, y_true_hard_at_w, write=False)
     print(json.dumps(report, indent=2))
+
+    print("\n== model versioning gate ==")
+    new_f1 = report["world_model_lstm"]["f1"]
+    promote = should_promote(new_f1, live_f1, force=force)
+    regressed = live_f1 is not None and new_f1 < live_f1 - LSTM_REGRESSION_TOLERANCE
+    if not promote:
+        save_model(lstm_model, hidden_size, num_layers, weights_path=CANDIDATE_LSTM_WEIGHTS, meta_path=CANDIDATE_LSTM_META)
+        with open(CANDIDATE_BENCHMARK_JSON, "w") as f:
+            json.dump(report, f, indent=2)
+        print(
+            f"HELD BACK, not promoted: new LSTM F1 {new_f1:.4f} is below the live model's "
+            f"{live_f1:.4f} by more than the {LSTM_REGRESSION_TOLERANCE:.2f} tolerance.\n"
+            f"The currently-live model ({LSTM_WEIGHTS.name}) is unchanged and still serving.\n"
+            f"Candidate saved to {CANDIDATE_LSTM_WEIGHTS.name} / {CANDIDATE_BENCHMARK_JSON.name} for inspection.\n"
+            f"To promote it anyway, run: python -m app.train --force"
+        )
+        print(f"\nTotal training pipeline time: {time.time() - t0:.1f}s (stopped after the versioning gate)")
+        return
+    save_model(lstm_model, hidden_size, num_layers)
+    with open(BENCHMARK_JSON, "w") as f:
+        json.dump(report, f, indent=2)
+    if live_f1 is None:
+        print(f"promoted: no previous model to compare against (F1 {new_f1:.4f}).")
+    elif regressed:
+        print(f"promoted with --force despite regressing: F1 {live_f1:.4f} -> {new_f1:.4f}.")
+    else:
+        print(f"promoted: F1 {live_f1:.4f} -> {new_f1:.4f}.")
 
     print("\n== calibration (reliability diagram @ horizon 3) ==")
     calib = compute_calibration(lstm_model, labeled, scaler, test_hosts | val_hosts, horizon=3)
@@ -246,6 +317,12 @@ def main():
     false_alarms = find_false_alarms(lstm_model, scaler, labeled, benign_test_hosts)
     print(f"found {len(false_alarms)} false-alarm example(s) on held-out benign hosts")
 
+    print("\n== threshold calibration (alert-budget report, does not change the default 0.5) ==")
+    threshold_report = calibrate_and_report(
+        lstm_model, scaler, labeled, benign_test_hosts, n_hosts_monitored=len(test_hosts) + len(val_hosts),
+    )
+    print(json.dumps(threshold_report, indent=2))
+
     print("\n== building recent forecast log for UI ==")
     build_recent_forecast_log(lstm_model, baseline_clf, scaler, labeled, test_hosts)
 
@@ -257,4 +334,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force", action="store_true",
+                         help="promote the new LSTM even if it scores worse than the currently-live one")
+    args = parser.parse_args()
+    main(force=args.force)

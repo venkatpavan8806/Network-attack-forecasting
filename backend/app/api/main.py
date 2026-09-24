@@ -291,6 +291,32 @@ def false_alarms():
     return service.false_alarm_examples()
 
 
+@app.get("/threshold-calibration")
+def threshold_calibration():
+    """What alert threshold would be needed for a given alerts-per-day
+    budget, computed from the model's real score distribution on held-out
+    benign traffic -- does not change the 0.5 threshold used elsewhere.
+    See app/evaluation/threshold_tuning.py."""
+    report = service.threshold_calibration_report()
+    if report is None:
+        raise HTTPException(status_code=404, detail="threshold calibration not yet computed; run `python -m app.train`")
+    return report
+
+
+@app.get("/robustness-report")
+def robustness_report():
+    """Variance across several independent training seeds (mean/std/CI, not
+    a single lucky-or-unlucky run) and cross-run generalization (train once,
+    evaluate on entirely fresh independently-generated worlds -- this
+    project's stand-in for a time-based split). See
+    app/evaluate_robustness.py; not run automatically by `python -m app.train`
+    (takes several minutes) -- run `python -m app.evaluate_robustness` separately."""
+    report = service.robustness_report()
+    if report is None:
+        raise HTTPException(status_code=404, detail="robustness report not yet computed; run `python -m app.evaluate_robustness`")
+    return report
+
+
 @app.get("/stage-classes")
 def stage_classes():
     return STAGE_CLASSES

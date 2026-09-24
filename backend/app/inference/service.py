@@ -12,7 +12,8 @@ import pandas as pd
 from app.config import (
     FEATURE_COLUMNS, SEQ_LEN, ROLLOUT_K, STAGE_CLASSES, IDX_TO_STAGE,
     SYNTHETIC_CSV, DATA_DIR, BENCHMARK_JSON, CALIBRATION_JSON, LEAD_TIME_JSON,
-    FALSE_ALARM_JSON, LSTM_WEIGHTS, BASELINE_WEIGHTS, SCALER_WEIGHTS, RANDOM_SEED,
+    FALSE_ALARM_JSON, LSTM_WEIGHTS, BASELINE_WEIGHTS, SCALER_WEIGHTS, RANDOM_SEED, THRESHOLD_CALIBRATION_JSON,
+    ROBUSTNESS_JSON,
     STAGE_MEAN_VECTORS_JSON, BRANCH_DEPTH, BRANCH_FACTOR,
 )
 from app.labeling.state_labeler import derive_state_labels
@@ -575,6 +576,12 @@ class InferenceService:
 
     def false_alarm_examples(self):
         return self.load_report(FALSE_ALARM_JSON) or []
+
+    def threshold_calibration_report(self):
+        return self.load_report(THRESHOLD_CALIBRATION_JSON)
+
+    def robustness_report(self):
+        return self.load_report(ROBUSTNESS_JSON)
 
 
 service = InferenceService()

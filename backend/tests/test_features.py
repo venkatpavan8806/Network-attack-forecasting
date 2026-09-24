@@ -43,6 +43,44 @@ def test_build_sequences_shapes():
     assert y_next.shape[1] == N_FEATURES
 
 
+def test_build_sequences_include_warmup_adds_examples_without_changing_defaults():
+    labeled = _small_labeled_dataset()
+    train, val, test = host_split(labeled)
+    scaler = fit_scaler(labeled, train)
+
+    X_default, _, _, _, meta_default = build_sequences(labeled, scaler, train)
+    X_warmup, _, _, _, meta_warmup = build_sequences(labeled, scaler, train, include_warmup=True)
+
+    # default behavior is unchanged -- no warm-up example ever appears
+    assert not any(m["is_warmup"] for m in meta_default)
+    # include_warmup=True strictly adds examples (SEQ_LEN - 1 per host, the
+    # windows before a full SEQ_LEN of real history exists), never removes any
+    assert X_warmup.shape[0] > X_default.shape[0]
+    assert X_warmup.shape[1:] == X_default.shape[1:]  # same (seq_len, n_features) shape either way
+    assert any(m["is_warmup"] for m in meta_warmup)
+    # every non-warmup example under include_warmup=True is identical to a
+    # default-run example for the same host/window -- warmup is purely additive
+    default_by_key = {(m["host_id"], m["window_idx_t"]): i for i, m in enumerate(meta_default)}
+    for i, m in enumerate(meta_warmup):
+        if not m["is_warmup"]:
+            j = default_by_key[(m["host_id"], m["window_idx_t"])]
+            np.testing.assert_allclose(X_warmup[i], X_default[j])
+
+
+def test_build_sequences_warmup_examples_are_left_padded_with_the_first_real_window():
+    labeled = _small_labeled_dataset()
+    train, val, test = host_split(labeled)
+    scaler = fit_scaler(labeled, train)
+    X_warmup, _, _, _, meta_warmup = build_sequences(labeled, scaler, train, include_warmup=True)
+
+    # the very first warm-up example (t=0) has SEQ_LEN-1 padding rows, all
+    # identical copies of the single real window
+    first_idx = next(i for i, m in enumerate(meta_warmup) if m["is_warmup"] and m["window_idx_t"] == 0)
+    window = X_warmup[first_idx]
+    for row in window[:-1]:
+        np.testing.assert_allclose(row, window[0])
+
+
 def test_build_single_window_table_shapes_and_binary_labels():
     labeled = _small_labeled_dataset()
     train, val, test = host_split(labeled)
@@ -66,9 +104,13 @@ def test_scaler_normalizes_train_features_to_roughly_zero_mean():
 # Feature schema
 # ---------------------------------------------------------------------------
 
-def test_feature_schema_has_31_features():
-    assert N_FEATURES == 31
-    assert len(FEATURE_COLUMNS) == 31
+def test_feature_schema_has_39_features():
+    """31 original + 8 per-port intensity features (syn_count_port_* and
+    failed_conn_ratio_port_* for each of the 4 watched ports), added to give
+    the model per-port signal richer than a binary "was this port touched"
+    flag -- see config.py:FEATURE_DOCS."""
+    assert N_FEATURES == 39
+    assert len(FEATURE_COLUMNS) == 39
 
 
 def test_feature_schema_names_are_unique_and_documented():

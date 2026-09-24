@@ -22,6 +22,10 @@ the honest, documented translation between the two:
   - `dst_port_is_22/445/3389/443` keep their EXACT original meaning: real
     destination port observed in real inbound packets. This is the
     least-adapted, most directly-comparable feature to training.
+  - `syn_count_port_*` / `failed_conn_ratio_port_*` also keep their exact
+    original meaning: real per-port SYN counts and per-port handshake
+    failure rate, computed the same way as the aggregate syn_count/
+    failed_conn_ratio below but scoped to one watched port at a time.
   - `failed_conn_ratio`, `ttl_mean/std`, `win_size_mean/std`, `iat_mean/std`
     are computed directly from real captured packet fields.
 
@@ -190,6 +194,7 @@ class FlowTracker:
         for r in inbound:
             by_port[r.local_port].append(r)
         durations, byte_totals, pkt_counts, completed = [], [], [], []
+        completed_by_port: dict[int, int] = {}
         for port, port_recs in by_port.items():
             ts_list = [r.ts for r in port_recs]
             durations.append(max(ts_list) - min(ts_list) if len(ts_list) > 1 else 0.0)
@@ -197,7 +202,9 @@ class FlowTracker:
             pkt_counts.append(len(port_recs))
             had_syn = any("S" in r.flags and "A" not in r.flags for r in port_recs)
             our_synack = any("S" in r.flags and "A" in r.flags for r in outbound if r.local_port == port)
-            completed.append(1 if (had_syn and our_synack) else 0)
+            is_completed = 1 if (had_syn and our_synack) else 0
+            completed.append(is_completed)
+            completed_by_port[port] = is_completed
 
         inbound_bytes = sum(r.pkt_len for r in inbound)
         outbound_bytes = sum(r.pkt_len for r in outbound)
@@ -251,7 +258,16 @@ class FlowTracker:
             "port_scan_score": float(min(1.0, len(local_ports_touched) / (flow_count + 2))),
         }
         for p in WATCHED_PORTS:
-            feats[f"dst_port_is_{p}"] = 1.0 if any(r.local_port == p for r in inbound) else 0.0
+            port_recs = by_port.get(p, [])
+            feats[f"dst_port_is_{p}"] = 1.0 if port_recs else 0.0
+            # per-port INTENSITY -- how much connection volume and how many
+            # failures concentrated on THIS specific port, computed the same
+            # way as the aggregate syn_count/failed_conn_ratio above but
+            # scoped to one port, so a brute-force against one service
+            # doesn't look identical to a brief touch of the same port --
+            # see config.py:FEATURE_DOCS for why this exists.
+            feats[f"syn_count_port_{p}"] = float(sum(1 for r in port_recs if "S" in r.flags and "A" not in r.flags))
+            feats[f"failed_conn_ratio_port_{p}"] = float(1.0 - completed_by_port[p]) if port_recs else 0.0
 
         return {k: feats[k] for k in FEATURE_COLUMNS}
 

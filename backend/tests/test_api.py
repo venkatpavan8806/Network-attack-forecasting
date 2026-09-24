@@ -186,3 +186,16 @@ def test_stage_classes_route(client):
     r = client.get("/stage-classes")
     assert r.status_code == 200
     assert "benign" in r.json()
+
+
+def test_threshold_calibration_route_404s_honestly_when_not_yet_computed(client, monkeypatch, tmp_path):
+    """The fixture's fast/tiny service never runs app.evaluate_... calibration
+    (that's train.py's job) -- the route must say so clearly, not crash.
+    Points THRESHOLD_CALIBRATION_JSON at a path that's guaranteed not to
+    exist, regardless of whether a real `python -m app.train` has been run
+    against this checkout's actual data/ directory."""
+    import app.inference.service as service_module
+    monkeypatch.setattr(service_module, "THRESHOLD_CALIBRATION_JSON", tmp_path / "no_such_file.json")
+    r = client.get("/threshold-calibration")
+    assert r.status_code == 404
+    assert "not yet computed" in r.json()["detail"]

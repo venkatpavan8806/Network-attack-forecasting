@@ -46,16 +46,48 @@ def _clip_pos(x: float, lo: float = 0.0) -> float:
     return float(max(lo, x))
 
 
-def _port_indicators(rng: np.random.Generator, focus_port: int | None = None,
-                      focus_prob: float = 0.0, background_prob: float = 0.05) -> dict:
-    """Returns the 4 dst_port_is_* indicators. `focus_port` (if one of
-    WATCHED_PORTS) gets flagged with probability `focus_prob`; every other
-    watched port gets flagged independently with `background_prob`, so
-    multiple indicators can legitimately be 1 in the same window."""
-    out = {}
+def _port_indicators(rng: np.random.Generator, syn_count: float, failed_conn_ratio: float,
+                      focus_port: int | None = None, focus_prob: float = 0.0,
+                      background_prob: float = 0.05) -> dict:
+    """Returns, for each of the 4 watched ports: the existing dst_port_is_*
+    binary indicator, PLUS syn_count_port_X and failed_conn_ratio_port_X --
+    how much of this window's connection volume and failures actually
+    concentrated on that specific port. A binary flag can't distinguish
+    "SSH briefly touched during a broad scan" from "SSH is being hammered by
+    repeated failed logins"; these two features can, which is what actually
+    lets the model tell SSH/RDP/SMB brute-force apart instead of only
+    knowing "some brute-force is happening". `focus_port` (if one of
+    WATCHED_PORTS) gets flagged with probability `focus_prob` and, if
+    flagged, absorbs most of the window's SYN volume and (being the port
+    actually under attack) the window's own failure rate; every other
+    watched port gets flagged independently with `background_prob` and, if
+    flagged, gets a small, independently-noisy share -- ordinary background
+    traffic touching a port is not evidence that port is being attacked."""
+    flags = {p: rng.random() < (focus_prob if p == focus_port else background_prob) for p in WATCHED_PORTS}
+    out = {f"dst_port_is_{p}": (1.0 if flags[p] else 0.0) for p in WATCHED_PORTS}
+
+    flagged = [p for p, on in flags.items() if on]
+    if not flagged:
+        for p in WATCHED_PORTS:
+            out[f"syn_count_port_{p}"] = 0.0
+            out[f"failed_conn_ratio_port_{p}"] = 0.0
+        return out
+
+    if focus_port in flagged:
+        n_background_flagged = max(1, len(flagged) - 1)
+        weights = {p: (0.75 if p == focus_port else 0.25 / n_background_flagged) for p in flagged}
+    else:
+        weights = {p: 1.0 / len(flagged) for p in flagged}
+
     for p in WATCHED_PORTS:
-        prob = focus_prob if p == focus_port else background_prob
-        out[f"dst_port_is_{p}"] = 1.0 if rng.random() < prob else 0.0
+        if p not in flagged:
+            out[f"syn_count_port_{p}"] = 0.0
+            out[f"failed_conn_ratio_port_{p}"] = 0.0
+            continue
+        out[f"syn_count_port_{p}"] = round(float(syn_count) * weights[p] * rng.uniform(0.8, 1.0))
+        out[f"failed_conn_ratio_port_{p}"] = (
+            float(failed_conn_ratio) if p == focus_port else float(np.clip(rng.beta(1, 15), 0, 1))
+        )
     return out
 
 
@@ -104,7 +136,8 @@ def sample_benign_window(rng: np.random.Generator) -> dict:
         "port_scan_score": _clip_pos(rng.beta(1, 30)),
     }
     # legitimate everyday traffic: HTTPS is common, admin protocols are rare
-    row.update(_port_indicators(rng, focus_port=443, focus_prob=0.35, background_prob=0.04))
+    row.update(_port_indicators(rng, row["syn_count"], row["failed_conn_ratio"],
+                                 focus_port=443, focus_prob=0.35, background_prob=0.04))
     return row
 
 
@@ -125,7 +158,8 @@ def sample_precursor_window(rng: np.random.Generator, target_port: int | None = 
     base["new_dst_ip_ratio"] = _clip_pos(rng.beta(2, 8))           # mildly elevated vs beta(1,10)
     base["iat_std"] = _clip_pos(rng.normal(0.12, 0.05))            # slightly more jitter than benign
     base["unique_dst_ports"] = base["unique_dst_ports"] + rng.poisson(2)
-    base.update(_port_indicators(rng, focus_port=target_port, focus_prob=0.3, background_prob=0.04))
+    base.update(_port_indicators(rng, base["syn_count"], base["failed_conn_ratio"],
+                                  focus_port=target_port, focus_prob=0.3, background_prob=0.04))
     return base
 
 
@@ -185,10 +219,12 @@ def sample_recon_window(rng: np.random.Generator, evasive: bool = False,
     }
     if narrow and target_port is not None:
         # the attacker has found something interesting and is narrowing focus
-        row.update(_port_indicators(rng, focus_port=target_port, focus_prob=0.7, background_prob=0.08))
+        row.update(_port_indicators(rng, row["syn_count"], row["failed_conn_ratio"],
+                                     focus_port=target_port, focus_prob=0.7, background_prob=0.08))
     else:
         # broad sweep: each watched port is touched with modest independent probability
-        row.update(_port_indicators(rng, focus_port=None, background_prob=0.18))
+        row.update(_port_indicators(rng, row["syn_count"], row["failed_conn_ratio"],
+                                     focus_port=None, background_prob=0.18))
     return row
 
 
@@ -230,7 +266,8 @@ def sample_bruteforce_window(rng: np.random.Generator, port: int) -> dict:
         "pkt_len_std": _clip_pos(rng.normal(80, 25)),
         "port_scan_score": _clip_pos(rng.beta(1, 25)),
     }
-    row.update(_port_indicators(rng, focus_port=port, focus_prob=0.92, background_prob=0.03))
+    row.update(_port_indicators(rng, row["syn_count"], row["failed_conn_ratio"],
+                                 focus_port=port, focus_prob=0.92, background_prob=0.03))
     return row
 
 
@@ -268,7 +305,8 @@ def sample_lateral_movement_window(rng: np.random.Generator, port: int) -> dict:
         "pkt_len_std": _clip_pos(rng.normal(180, 50)),
         "port_scan_score": _clip_pos(rng.beta(2, 15)),
     }
-    row.update(_port_indicators(rng, focus_port=port, focus_prob=0.85, background_prob=0.04))
+    row.update(_port_indicators(rng, row["syn_count"], row["failed_conn_ratio"],
+                                 focus_port=port, focus_prob=0.85, background_prob=0.04))
     return row
 
 
@@ -305,7 +343,8 @@ def sample_c2_window(rng: np.random.Generator) -> dict:
     }
     # HTTPS-cloaked beaconing: same port benign traffic uses, so port alone
     # can't distinguish it -- the timing regularity above is what has to.
-    row.update(_port_indicators(rng, focus_port=443, focus_prob=0.85, background_prob=0.03))
+    row.update(_port_indicators(rng, row["syn_count"], row["failed_conn_ratio"],
+                                 focus_port=443, focus_prob=0.85, background_prob=0.03))
     return row
 
 
@@ -340,7 +379,8 @@ def sample_exfiltration_window(rng: np.random.Generator) -> dict:
         "pkt_len_std": _clip_pos(rng.normal(150, 40)),
         "port_scan_score": _clip_pos(rng.beta(1, 40)),
     }
-    row.update(_port_indicators(rng, focus_port=443, focus_prob=0.8, background_prob=0.03))
+    row.update(_port_indicators(rng, row["syn_count"], row["failed_conn_ratio"],
+                                 focus_port=443, focus_prob=0.8, background_prob=0.03))
     return row
 
 

@@ -415,3 +415,40 @@ export interface StepTrackingReport {
     heldout_hosts_vs_lstm: { hosts: string[]; note: string } & Record<string, any>;
   };
 }
+
+// -- GET /threshold-calibration -------------------------------------------------
+export interface ThresholdBudget { target_alerts_per_day: number; required_threshold: number }
+export interface ThresholdCalibrationReport {
+  n_benign_windows: number;
+  n_hosts_monitored_assumption: number;
+  window_seconds: number;
+  benign_score_percentiles: Record<string, number>;
+  current_fixed_threshold: { threshold: number; false_positive_rate_on_held_out_benign: number; implied_alerts_per_day: number };
+  budgets: ThresholdBudget[];
+  note: string;
+}
+
+// -- GET /robustness-report -------------------------------------------------
+export interface RobustnessMetricStat {
+  values_by_seed: number[];
+  mean: number;
+  std: number;
+  ci95_low: number;
+  ci95_high: number;
+}
+export interface RobustnessReport {
+  variance_across_seeds: {
+    seeds: number[];
+    world_model_lstm: Record<string, RobustnessMetricStat>;
+    baseline_logistic_regression: Record<string, RobustnessMetricStat>;
+    note: string;
+  };
+  cross_run_generalization: {
+    trained_on_seed: number;
+    own_held_out_test_f1: number;
+    fresh_world_results: Array<{ seed: number; f1: number } & Record<string, number>>;
+    mean_fresh_world_f1: number;
+    generalization_gap: number;
+    note: string;
+  };
+}

@@ -121,9 +121,15 @@ def infiltration_probability(stage_probs: np.ndarray) -> float:
     return float(1.0 - stage_probs[BENIGN_IDX])
 
 
-def save_model(model: LSTMWorldModel, hidden_size: int, num_layers: int):
-    torch.save(model.state_dict(), LSTM_WEIGHTS)
-    with open(LSTM_META, "w") as f:
+def save_model(model: LSTMWorldModel, hidden_size: int, num_layers: int,
+                weights_path=LSTM_WEIGHTS, meta_path=LSTM_META):
+    """weights_path/meta_path default to the LIVE model location; train.py's
+    regression gate (see _load_live_lstm_f1/promote in app/train.py) passes
+    a separate `candidate_*` path when a newly-trained model scores worse
+    than the currently-live one, so the rejected candidate is inspectable
+    without overwriting what's actually deployed."""
+    torch.save(model.state_dict(), weights_path)
+    with open(meta_path, "w") as f:
         json.dump({
             "hidden_size": hidden_size,
             "num_layers": num_layers,
@@ -135,13 +141,13 @@ def save_model(model: LSTMWorldModel, hidden_size: int, num_layers: int):
         }, f, indent=2)
 
 
-def load_model() -> LSTMWorldModel:
-    with open(LSTM_META) as f:
+def load_model(weights_path=LSTM_WEIGHTS, meta_path=LSTM_META) -> LSTMWorldModel:
+    with open(meta_path) as f:
         meta = json.load(f)
     model = LSTMWorldModel(n_features=meta["n_features"], hidden_size=meta["hidden_size"],
                             num_layers=meta["num_layers"], n_classes=meta["n_classes"],
                             cnn_channels=meta.get("cnn_channels", (16, 32)))
-    model.load_state_dict(torch.load(LSTM_WEIGHTS, map_location="cpu", weights_only=True))
+    model.load_state_dict(torch.load(weights_path, map_location="cpu", weights_only=True))
     model.eval()
     return model
 

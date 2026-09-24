@@ -88,10 +88,14 @@ or the UI.
 
 ## Feature schema and anti-leakage rule
 
-`app/config.py:FEATURE_COLUMNS` lists the 27 traffic-shaped features (flow
+`app/config.py:FEATURE_COLUMNS` lists the 39 traffic-shaped features (flow
 counts, TCP flag counts, flow duration stats, byte/packet stats, inter-
 arrival-time stats, TTL stats, TCP window-size stats, packet-length stats, a
-port-scan score, and new-destination-IP ratio). **The ground-truth attack
+port-scan score, new-destination-IP ratio, plus per-port SYN counts and
+per-port failed-connection ratios for each of the 4 watched ports -- added
+so the model can tell SSH/RDP/SMB brute-force apart by which port actually
+concentrates the connection volume and failures, not just a binary "was
+this port touched" flag). **The ground-truth attack
 stage is never one-hot-encoded or otherwise embedded in this feature
 vector** — it is generated and stored as a separate `true_stage` /
 `state_label` column, and the LSTM and baseline only ever see

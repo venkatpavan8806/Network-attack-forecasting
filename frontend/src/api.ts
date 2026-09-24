@@ -5,6 +5,7 @@ import type {
   SandboxTestResult, AttackMapping, MitigationInfo, CounterfactualResponse,
   HostTimelineEntry, LiveStatus, LiveWindowEntry, LiveInterface, TripwireAlert, LivePacket,
   ShapResponse, DefenseAdvice, BranchingForecastResponse, TrackResponse, StepTrackingReport,
+  ThresholdCalibrationReport, RobustnessReport,
 } from './types';
 
 const client = axios.create({ baseURL: '/api' });
@@ -29,6 +30,8 @@ export const api = {
   track: (hostId: string, atWindowIdx?: number) =>
     client.get<TrackResponse>(`/track/${encodeURIComponent(hostId)}`, { params: atWindowIdx != null ? { at_window_idx: atWindowIdx } : {} }).then((r) => r.data),
   stepTrackingReport: () => client.get<StepTrackingReport>('/step-tracking-report').then((r) => r.data),
+  thresholdCalibration: () => client.get<ThresholdCalibrationReport>('/threshold-calibration').then((r) => r.data),
+  robustnessReport: () => client.get<RobustnessReport>('/robustness-report').then((r) => r.data),
   attackStageBreakdown: () => client.get<StageBreakdown>('/attack-stage-breakdown').then((r) => r.data),
   forecastLog: (limit = 25) => client.get<ForecastLogRow[]>('/forecast-log', { params: { limit } }).then((r) => r.data),
   attackMapping: () => client.get<AttackMapping[]>('/attack-mapping').then((r) => r.data),

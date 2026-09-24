@@ -23,11 +23,21 @@ LEAD_TIME_JSON = DATA_DIR / "lead_time_report.json"
 FALSE_ALARM_JSON = DATA_DIR / "false_alarm_examples.json"
 FORECAST_LOG_JSON = DATA_DIR / "recent_forecast_log.json"
 STAGE_MEAN_VECTORS_JSON = DATA_DIR / "stage_mean_vectors.json"
+THRESHOLD_CALIBRATION_JSON = DATA_DIR / "threshold_calibration.json"
+ROBUSTNESS_JSON = DATA_DIR / "robustness_report.json"
 
 LSTM_WEIGHTS = MODELS_DIR / "lstm_world_model.pt"
 LSTM_META = MODELS_DIR / "lstm_world_model_meta.json"
 BASELINE_WEIGHTS = MODELS_DIR / "baseline_logreg.joblib"
 SCALER_WEIGHTS = MODELS_DIR / "feature_scaler.joblib"
+
+# Where a newly-trained LSTM lands when app/train.py's regression gate holds
+# it back instead of promoting it -- see train.py:_load_live_lstm_f1/promote.
+# Never read by the running API; inspection/debugging only.
+CANDIDATE_LSTM_WEIGHTS = MODELS_DIR / "candidate_lstm_world_model.pt"
+CANDIDATE_LSTM_META = MODELS_DIR / "candidate_lstm_world_model_meta.json"
+CANDIDATE_BENCHMARK_JSON = DATA_DIR / "candidate_benchmark_report.json"
+LSTM_REGRESSION_TOLERANCE = 0.02  # a new LSTM's F1 may fall at most this much below the live model's before being held back
 
 # ---------------------------------------------------------------------------
 # Window / simulation parameters
@@ -382,6 +392,22 @@ FEATURE_COLUMNS = [
     "dst_port_is_445",
     "dst_port_is_3389",
     "dst_port_is_443",
+    # per-port INTENSITY -- how much of this window's connection volume and
+    # how many of its failures actually concentrated on each watched port,
+    # not just whether it was touched at all. A binary flag can't tell "SSH
+    # briefly touched during a broad scan" from "SSH is being hammered by
+    # repeated failed logins"; these can -- which is what lets the model
+    # distinguish which SPECIFIC service (SSH vs RDP vs SMB) a brute-force
+    # or lateral-movement window is actually targeting, instead of only
+    # recognizing "some brute-force-shaped traffic is happening".
+    "syn_count_port_22",
+    "syn_count_port_445",
+    "syn_count_port_3389",
+    "syn_count_port_443",
+    "failed_conn_ratio_port_22",
+    "failed_conn_ratio_port_445",
+    "failed_conn_ratio_port_3389",
+    "failed_conn_ratio_port_443",
 ]
 
 N_FEATURES = len(FEATURE_COLUMNS)
@@ -619,6 +645,62 @@ FEATURE_DOCS = {
         "calculation": "1.0 if any flow in the window targets destination port 443, else 0.0.",
         "purpose": "Legitimate, directly-observable destination-port telemetry -- NOT a one-hot of the attack label.",
         "kind": "observed",
+    },
+    "syn_count_port_22": {
+        "meaning": "Number of SYN packets in the window addressed to port 22 (SSH) specifically.",
+        "unit_or_range": "count, >= 0",
+        "calculation": "Count of SYN packets whose destination port is 22.",
+        "purpose": "Per-port connection-attempt volume; lets the model see HOW MUCH activity concentrated on SSH, not just whether it was touched.",
+        "kind": "observed",
+    },
+    "syn_count_port_445": {
+        "meaning": "Number of SYN packets in the window addressed to port 445 (SMB) specifically.",
+        "unit_or_range": "count, >= 0",
+        "calculation": "Count of SYN packets whose destination port is 445.",
+        "purpose": "Per-port connection-attempt volume; lets the model see HOW MUCH activity concentrated on SMB, not just whether it was touched.",
+        "kind": "observed",
+    },
+    "syn_count_port_3389": {
+        "meaning": "Number of SYN packets in the window addressed to port 3389 (RDP) specifically.",
+        "unit_or_range": "count, >= 0",
+        "calculation": "Count of SYN packets whose destination port is 3389.",
+        "purpose": "Per-port connection-attempt volume; lets the model see HOW MUCH activity concentrated on RDP, not just whether it was touched.",
+        "kind": "observed",
+    },
+    "syn_count_port_443": {
+        "meaning": "Number of SYN packets in the window addressed to port 443 (HTTPS) specifically.",
+        "unit_or_range": "count, >= 0",
+        "calculation": "Count of SYN packets whose destination port is 443.",
+        "purpose": "Per-port connection-attempt volume; lets the model see HOW MUCH activity concentrated on HTTPS/C2/exfil traffic, not just whether it was touched.",
+        "kind": "observed",
+    },
+    "failed_conn_ratio_port_22": {
+        "meaning": "Fraction of connection attempts to port 22 (SSH) that did not complete a handshake.",
+        "unit_or_range": "ratio, [0, 1]; 0.0 if port 22 saw no traffic this window",
+        "calculation": "1 - (completed SSH handshakes / SSH connection attempts), clipped to [0, 1].",
+        "purpose": "Per-port failure rate: SSH brute-force concentrates failures specifically on port 22, distinguishing it from RDP/SMB brute-force in the same window.",
+        "kind": "engineered",
+    },
+    "failed_conn_ratio_port_445": {
+        "meaning": "Fraction of connection attempts to port 445 (SMB) that did not complete a handshake.",
+        "unit_or_range": "ratio, [0, 1]; 0.0 if port 445 saw no traffic this window",
+        "calculation": "1 - (completed SMB handshakes / SMB connection attempts), clipped to [0, 1].",
+        "purpose": "Per-port failure rate: SMB brute-force concentrates failures specifically on port 445, distinguishing it from SSH/RDP brute-force in the same window.",
+        "kind": "engineered",
+    },
+    "failed_conn_ratio_port_3389": {
+        "meaning": "Fraction of connection attempts to port 3389 (RDP) that did not complete a handshake.",
+        "unit_or_range": "ratio, [0, 1]; 0.0 if port 3389 saw no traffic this window",
+        "calculation": "1 - (completed RDP handshakes / RDP connection attempts), clipped to [0, 1].",
+        "purpose": "Per-port failure rate: RDP brute-force concentrates failures specifically on port 3389, distinguishing it from SSH/SMB brute-force in the same window.",
+        "kind": "engineered",
+    },
+    "failed_conn_ratio_port_443": {
+        "meaning": "Fraction of connection attempts to port 443 (HTTPS) that did not complete a handshake.",
+        "unit_or_range": "ratio, [0, 1]; 0.0 if port 443 saw no traffic this window",
+        "calculation": "1 - (completed HTTPS handshakes / HTTPS connection attempts), clipped to [0, 1].",
+        "purpose": "Per-port failure rate on the port C2/exfiltration traffic typically hides behind.",
+        "kind": "engineered",
     },
 }
 assert set(FEATURE_DOCS.keys()) == set(FEATURE_COLUMNS), "FEATURE_DOCS must document exactly the FEATURE_COLUMNS set"

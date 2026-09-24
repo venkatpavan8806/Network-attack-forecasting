@@ -7,6 +7,8 @@ import { api } from '../api';
 import type { BenchmarkReport, CalibrationReport, LeadTimeReport } from '../types';
 import CardHeader from '../components/CardHeader';
 import StepTrackingReportCard from '../components/StepTrackingReportCard';
+import ThresholdCalibrationCard from '../components/ThresholdCalibrationCard';
+import RobustnessReportCard from '../components/RobustnessReportCard';
 
 function metricRows(report: BenchmarkReport) {
   const keys: (keyof BenchmarkReport['world_model_lstm'])[] = ['precision', 'recall', 'f1', 'false_positive_rate'];
@@ -142,6 +144,8 @@ export default function Benchmarks() {
       </div>
 
       <StepTrackingReportCard />
+      <RobustnessReportCard />
+      <ThresholdCalibrationCard />
     </div>
   );
 }

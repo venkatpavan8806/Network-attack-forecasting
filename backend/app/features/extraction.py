@@ -148,22 +148,42 @@ def load_scaler(path=SCALER_WEIGHTS) -> StandardScaler:
     return joblib.load(path)
 
 
-def build_sequences(labeled_df: pd.DataFrame, scaler: StandardScaler, hosts: set, seq_len: int = SEQ_LEN):
+def build_sequences(labeled_df: pd.DataFrame, scaler: StandardScaler, hosts: set, seq_len: int = SEQ_LEN,
+                     include_warmup: bool = False):
     """For each host restricted to `hosts`, builds sliding-window sequences:
       X: (n_samples, seq_len, n_features)          -- normalized S_{t-seq_len+1..t}
       y_stage: (n_samples,)                         -- class idx of state_label at t+1
       y_next_state: (n_samples, n_features)         -- normalized S_{t+1} (regression target)
       y_cur_stage: (n_samples,)                     -- class idx of state_label at t (for reference/eval)
-      meta: list of dicts (host_id, window_idx of t, window_idx of t+1)
-    """
+      meta: list of dicts (host_id, window_idx of t, window_idx of t+1, is_warmup)
+
+    include_warmup=False (default): only t >= seq_len - 1, i.e. every window
+    has `seq_len` REAL windows of history -- the original behavior.
+
+    include_warmup=True: ALSO includes t = 0 .. seq_len - 2, where fewer than
+    seq_len real windows exist yet. Those are left-padded by repeating the
+    earliest real window, via the exact same padded_window() the step
+    tracker (app/tracking/step_tracker.py) and live capture use at inference
+    time for a host's first SEQ_LEN-1 windows. Without this, the model is
+    trained ONLY on full-history inputs and then asked at inference time to
+    handle padded warm-up inputs it never saw a single example of during
+    training -- a train/inference distribution mismatch. train.py enables
+    this for the LSTM's own training set specifically."""
+    from app.tracking.step_tracker import padded_window
+
     X_list, y_stage_list, y_next_list, y_cur_list, meta = [], [], [], [], []
     for host_id, host_df in labeled_df[labeled_df["host_id"].isin(hosts)].groupby("host_id", sort=False):
         host_df = host_df.sort_values("window_idx").reset_index(drop=True)
         feats = scaler.transform(host_df[FEATURE_COLUMNS].values)
         labels = host_df["state_label"].map(STAGE_TO_IDX).values
         n = len(host_df)
-        for t in range(seq_len - 1, n - 1):
-            X_list.append(feats[t - seq_len + 1:t + 1])
+        start_t = 0 if include_warmup else seq_len - 1
+        for t in range(start_t, n - 1):
+            if t - seq_len + 1 < 0:
+                window, n_real = padded_window(feats, t, seq_len=seq_len)
+            else:
+                window, n_real = feats[t - seq_len + 1:t + 1], seq_len
+            X_list.append(window)
             y_stage_list.append(labels[t + 1])
             y_next_list.append(feats[t + 1])
             y_cur_list.append(labels[t])
@@ -171,6 +191,7 @@ def build_sequences(labeled_df: pd.DataFrame, scaler: StandardScaler, hosts: set
                 "host_id": host_id,
                 "window_idx_t": int(host_df.loc[t, "window_idx"]),
                 "window_idx_next": int(host_df.loc[t + 1, "window_idx"]),
+                "is_warmup": n_real < seq_len,
             })
     return (
         np.array(X_list, dtype=np.float32),
