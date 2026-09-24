@@ -4,7 +4,7 @@ import type {
   BenchmarkReport, CalibrationReport, LeadTimeReport, FalseAlarmExample,
   SandboxTestResult, AttackMapping, MitigationInfo, CounterfactualResponse,
   HostTimelineEntry, LiveStatus, LiveWindowEntry, LiveInterface, TripwireAlert, LivePacket,
-  ShapResponse, DefenseAdvice, BranchingForecastResponse,
+  ShapResponse, DefenseAdvice, BranchingForecastResponse, TrackResponse, StepTrackingReport,
 } from './types';
 
 const client = axios.create({ baseURL: '/api' });
@@ -26,6 +26,9 @@ export const api = {
         ...(branchFactor != null ? { branch_factor: branchFactor } : {}),
       },
     }).then((r) => r.data),
+  track: (hostId: string, atWindowIdx?: number) =>
+    client.get<TrackResponse>(`/track/${encodeURIComponent(hostId)}`, { params: atWindowIdx != null ? { at_window_idx: atWindowIdx } : {} }).then((r) => r.data),
+  stepTrackingReport: () => client.get<StepTrackingReport>('/step-tracking-report').then((r) => r.data),
   attackStageBreakdown: () => client.get<StageBreakdown>('/attack-stage-breakdown').then((r) => r.data),
   forecastLog: (limit = 25) => client.get<ForecastLogRow[]>('/forecast-log', { params: { limit } }).then((r) => r.data),
   attackMapping: () => client.get<AttackMapping[]>('/attack-mapping').then((r) => r.data),

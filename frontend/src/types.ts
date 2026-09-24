@@ -357,3 +357,61 @@ export interface DefenseAdvice {
   trajectory_without: number[];
   trajectory_with_recommended: number[] | null;
 }
+
+// -- step-by-step attacker tracking (GET /track/{host_id}) --------------------
+export interface TrackCandidate { action: string; probability: number }
+export interface NextMoveCandidate { move: string; probability: number }
+export interface NextMoves {
+  method: string;
+  per_step: NextMoveCandidate[][];
+  top_sequences: { moves: string[]; probability: number }[];
+}
+export interface TrackStep {
+  step: number;
+  window_idx: number;
+  history_windows_used: number;
+  warmup: boolean;
+  predicted_next_action: string;
+  confidence: number;
+  top_candidates: TrackCandidate[];
+  infiltration_probability: number;
+  attack_path_so_far: string[];
+  next_moves: NextMoves | null;
+  actual_current_action?: string;
+  actual_next_action?: string | null;
+  correct?: boolean | null;
+  correct_top3?: boolean;
+  is_transition?: boolean;
+}
+export interface TrackSummary {
+  n_windows: number;
+  n_warmup_windows: number;
+  first_prediction_after_window: number | null;
+  old_first_prediction_after_window: number;
+  first_attack_alert_step: number | null;
+  attack_path_recognised: string[];
+  decision_rule: string;
+  accuracy_top1?: number;
+  accuracy_top3?: number;
+  accuracy_warmup_windows?: number | null;
+  accuracy_full_history_windows?: number | null;
+  n_transitions?: number;
+  accuracy_on_transitions?: number | null;
+  attack_path_actual?: string[] | null;
+}
+export interface TrackResponse { host_id: string; steps: TrackStep[]; summary: TrackSummary }
+
+// -- GET /step-tracking-report -------------------------------------------------
+export interface MoveScore { n: number; exact_match: number; tactic_level_match: number; top3_accuracy?: number }
+export type MethodScores = Partial<Record<'next_1' | 'next_2' | 'next_3', MoveScore>>;
+export interface StepTrackingReport {
+  decision_metric: Record<string, string>;
+  window_level_tracking: Record<string, any>;
+  cold_start: { setup: string; accuracy_by_step: Record<string, number | null>; accuracy_warmup_overall: number | null; old_pipeline_first_prediction_after_window: number };
+  path_recognition: { n_attack_hosts: number; tactic_level_exact_match: number; technique_level_exact_match: number; heldout_only: Record<string, number> };
+  multi_step_moves: {
+    unit: string;
+    leave_one_host_out_all_attack_hosts: Record<string, MethodScores>;
+    heldout_hosts_vs_lstm: { hosts: string[]; note: string } & Record<string, any>;
+  };
+}

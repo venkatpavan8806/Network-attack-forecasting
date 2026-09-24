@@ -6,6 +6,7 @@ import CardHeader from '../components/CardHeader';
 import TrajectoryChart, { type TrajectoryPoint } from '../components/TrajectoryChart';
 import BranchingForecastTree, { PathSummaryList } from '../components/BranchingForecastTree';
 import LiveCapturePanel from '../components/LiveCapturePanel';
+import AttackerStepTracker from '../components/AttackerStepTracker';
 import MitreForecastGraph from '../components/MitreForecastGraph';
 import AttackForecastDetails from '../components/AttackForecastDetails';
 import { downloadForecastPdf } from '../pdfReport';
@@ -187,6 +188,8 @@ export default function Forecasts({ selectedHost, onSelectHost }: { selectedHost
           </div>
         )}
       </div>
+
+      <AttackerStepTracker hostId={selectedHost} />
 
       <div className="card p-6">
         <CardHeader

@@ -31,6 +31,9 @@ from app.models.lstm_world_model import infiltration_probability
 from app.models.attack_mapping import map_stage
 from app.explain.attention import explain_prediction
 from app import db
+from app.tracking.step_tracker import padded_window
+
+FULL_HISTORY_MAX = 1000  # windows kept per remote IP for step-by-step tracking
 
 
 class LiveCaptureManager:
@@ -42,6 +45,9 @@ class LiveCaptureManager:
         self._sniff_thread: threading.Thread | None = None
         self._window_thread: threading.Thread | None = None
         self.history: dict[str, deque] = {}
+        # every window seen per remote IP (capped), so the step-by-step
+        # tracker can replay a live host from its FIRST window
+        self.full_history: dict[str, deque] = {}
         self.window_counter: dict[str, int] = {}
         self.recent_predictions: deque = deque(maxlen=100)
         self.started_at: str | None = None
@@ -66,6 +72,7 @@ class LiveCaptureManager:
         self.local_ip = local_ip
         self.tracker = FlowTracker(local_ip)
         self.history = {}
+        self.full_history = {}
         self.window_counter = {}
         self.packets_seen = 0
         self.error = None
@@ -149,6 +156,7 @@ class LiveCaptureManager:
             row = np.array([feats[c] for c in FEATURE_COLUMNS], dtype=np.float32)
             hist = self.history.setdefault(remote_ip, deque(maxlen=SEQ_LEN))
             hist.append(row)
+            self.full_history.setdefault(remote_ip, deque(maxlen=FULL_HISTORY_MAX)).append(row)
             self.window_counter[remote_ip] = self.window_counter.get(remote_ip, 0) + 1
             window_idx = self.window_counter[remote_ip]
             host_id = f"live:{remote_ip}"
@@ -163,9 +171,16 @@ class LiveCaptureManager:
                 "infiltration_probability_baseline": None,
             }
 
-            if len(hist) == SEQ_LEN:
+            # Predict after EVERY window, including the first SEQ_LEN-1:
+            # while fewer than SEQ_LEN windows exist, the input is
+            # left-padded with the earliest window (warm-up) -- see
+            # app/tracking/step_tracker.py:padded_window.
+            if len(hist) >= 1:
                 window_raw = np.stack(list(hist))
                 window_scaled = service.scaler.transform(window_raw).astype(np.float32)
+                window_scaled, n_real = padded_window(window_scaled, len(window_scaled) - 1)
+                entry["history_windows_used"] = n_real
+                entry["warmup"] = n_real < SEQ_LEN
                 explanation = explain_prediction(service.model, window_scaled)
                 baseline_prob = float(service.baseline.predict_proba(window_scaled[-1:])[0, 1])
                 predicted_stage = max(explanation["stage_probabilities"].items(), key=lambda kv: kv[1])[0]
