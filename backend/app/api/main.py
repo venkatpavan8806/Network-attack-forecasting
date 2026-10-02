@@ -8,7 +8,9 @@ from __future__ import annotations
 import io
 
 import pandas as pd
+# pyrefly: ignore [missing-import]
 from fastapi import FastAPI, UploadFile, File, HTTPException
+# pyrefly: ignore [missing-import]
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -160,13 +162,39 @@ def mitigations():
 @app.get("/counterfactual/{host_id}")
 def counterfactual(host_id: str, mitigation_id: str = "isolate_host", at_window_idx: int | None = None):
     """Digital-twin what-if: compares the world model's predicted
-    trajectory with vs. without a named mitigation, starting from the
-    host's real most-recent observed window (or `at_window_idx`).
-    Model-based counterfactual -- not a live network simulation. See
-    app/simulation/counterfactual.py."""
+    trajectory with vs. without a named mitigation applied to the cloned
+    Digital Twin network state. Safe sandbox simulation -- real_network_touched: false."""
     _require_ready()
     try:
         return service.run_counterfactual(host_id, mitigation_id, at_window_idx=at_window_idx)
+    except ValueError as e:
+        raise HTTPException(status_code=404 if "unknown host_id" in str(e) else 400, detail=str(e))
+
+
+class DigitalTwinSimulateRequest(BaseModel):
+    host_id: str
+    mitigation_id: str = "isolate_host"
+    at_window_idx: int | None = None
+
+
+@app.get("/digital-twin/state/{host_id}")
+def digital_twin_state(host_id: str):
+    """Returns the current logical Digital Twin network state, services, and firewall policy."""
+    _require_ready()
+    try:
+        from app.simulation.network_twin import build_initial_twin_network
+        twin = build_initial_twin_network(host_id, is_live=host_id.startswith("live:"))
+        return twin.to_dict()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/digital-twin/simulate")
+def digital_twin_simulate(req: DigitalTwinSimulateRequest):
+    """Runs a safe sandbox simulation on a cloned Digital Twin network state."""
+    _require_ready()
+    try:
+        return service.run_counterfactual(req.host_id, req.mitigation_id, at_window_idx=req.at_window_idx)
     except ValueError as e:
         raise HTTPException(status_code=404 if "unknown host_id" in str(e) else 400, detail=str(e))
 
@@ -339,6 +367,7 @@ def live_interfaces():
     """Real network interfaces on this machine with an IPv4 address, so the
     UI can offer a picker instead of free-text entry."""
     try:
+        # pyrefly: ignore [missing-import]
         from scapy.arch.windows import get_windows_if_list
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"scapy unavailable: {e}")
