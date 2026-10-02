@@ -29,6 +29,7 @@ from app.explain.shap_baseline import BaselineShapExplainer
 from app.defense.advisor import build_advice
 from app.simulation.mitigations import get_mitigation_fn, list_mitigations
 from app.simulation.counterfactual import compare_with_and_without, rollout_counterfactual
+from app.simulation.sandbox import DigitalTwinSandbox
 from app import db
 from app.models.ngram_move_model import NGramMoveModel, NGRAM_MODEL_JSON, labels_to_moves
 from app.tracking.step_tracker import track_host
@@ -353,53 +354,31 @@ class InferenceService:
             results.append(self.forecast_host_from_dataframe(str(host_id), host_df, log_source="ingest"))
         return results
 
-    # -- digital twin: model-based counterfactual "what if" -------------
+    # -- digital twin: model-based counterfactual + network state sandbox -------------
     def _counterfactual_result(self, host_id: str, window_idx: int, mitigation_id: str,
-                                seed_raw: np.ndarray, true_stage=None, state_label=None):
-        mitigation_fn = get_mitigation_fn(mitigation_id)
-        baseline_roll, mitigated_roll, metrics = compare_with_and_without(self.model, self.scaler, seed_raw, mitigation_fn, k=ROLLOUT_K)
-        mitigations_meta = {m["id"]: m for m in list_mitigations()}
-
-        divergences = []
-        for h, (a, b) in enumerate(zip(baseline_roll["predicted_stage"], mitigated_roll["predicted_stage"]), start=1):
-            if a != b:
-                divergences.append({
-                    "horizon": h,
-                    "without_mitigation_action": a,
-                    "with_mitigation_action": b,
-                })
-
-        return {
-            "host_id": host_id,
-            "window_idx": window_idx,
-            "mitigation": mitigations_meta[mitigation_id],
-            "horizon_windows": ROLLOUT_K,
-            "without_mitigation": {
-                "infiltration_probs": [round(p, 4) for p in baseline_roll["infiltration_probs"]],
-                "predicted_stage_per_horizon": baseline_roll["predicted_stage"],
-            },
-            "with_mitigation": {
-                "infiltration_probs": [round(p, 4) for p in mitigated_roll["infiltration_probs"]],
-                "predicted_stage_per_horizon": mitigated_roll["predicted_stage"],
-            },
-            "action_divergences": divergences,
-            "metrics": metrics,
-            "true_stage": true_stage,
-            "state_label": state_label,
-        }
+                                seed_raw: np.ndarray, true_stage=None, state_label=None, is_live=False):
+        sandbox = DigitalTwinSandbox(self.model, self.scaler)
+        return sandbox.run_sandbox_simulation(
+            host_id=host_id,
+            mitigation_id=mitigation_id,
+            seed_raw=seed_raw,
+            at_window_idx=window_idx,
+            true_stage=true_stage,
+            state_label=state_label,
+            is_live=is_live,
+        )
 
     def run_counterfactual(self, host_id: str, mitigation_id: str, at_window_idx: int | None = None):
         """Compares the world model's predicted infiltration trajectory with
-        and without a named mitigation applied, starting from the host's
-        real most-recent observed window (or `at_window_idx`, to replay a
-        specific moment such as "right when brute-force was detected"). Not
-        a live network simulation -- see app/simulation/counterfactual.py."""
+        and without a named mitigation applied to the cloned Digital Twin network
+        state, starting from the host's real most-recent observed window (or
+        `at_window_idx`). Safe sandbox simulation -- real_network_touched: false."""
         if host_id.startswith("live:"):
             if at_window_idx is not None:
                 raise ValueError("at_window_idx is not supported for live hosts -- live capture only keeps the most recent 8 windows, there's no history to rewind to")
             remote_ip = host_id[len("live:"):]
             seed_raw, window_idx = self._live_history_raw(remote_ip)
-            return self._counterfactual_result(host_id, window_idx, mitigation_id, seed_raw)
+            return self._counterfactual_result(host_id, window_idx, mitigation_id, seed_raw, is_live=True)
 
         if self.labeled_df is None:
             raise ArtifactsNotReadyError("no dataset loaded; run app.train first")
@@ -417,6 +396,7 @@ class InferenceService:
         return self._counterfactual_result(
             host_id, int(last_row["window_idx"]), mitigation_id, seed_raw,
             true_stage=last_row.get("true_stage"), state_label=last_row.get("state_label"),
+            is_live=False,
         )
 
     def available_mitigations(self):
