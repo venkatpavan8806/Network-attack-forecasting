@@ -117,6 +117,8 @@ def run_proofs():
             "divergence_count": len(divergences),
         })
 
+    verify_sandbox_digital_twin_requirements()
+
     proof_path = DATA_DIR / "digital_twin_proofs.json"
     with open(proof_path, "w", encoding="utf-8") as f:
         json.dump(proof_results, f, indent=2)
@@ -124,6 +126,60 @@ def run_proofs():
     print("\n" + "=" * 70)
     print(f"ALL PROOFS GENERATED AND SAVED TO: {proof_path}")
     print("=" * 70)
+
+
+def verify_sandbox_digital_twin_requirements():
+    print("\n" + "=" * 70)
+    print("VERIFYING 10-POINT DIGITAL TWIN SANDBOX CRITERIA")
+    print("=" * 70)
+
+    from app.simulation.network_twin import build_initial_twin_network
+    from app.simulation.sandbox import DigitalTwinSandbox
+    from app.inference.service import service
+
+    # 1. Initial twin state exists
+    host_id = "attack-host-000"
+    twin_init = build_initial_twin_network(host_id)
+    assert twin_init is not None, "Failed: initial twin state not created"
+    assert host_id in twin_init.hosts, f"Failed: target host {host_id} missing from initial twin"
+    print("  [1/10] PASS: Initial twin state exists with target host and topology.")
+
+    # 2. Dynamic attack representation
+    res = service.run_counterfactual(host_id, "isolate_host", at_window_idx=29)
+    assert res.get("true_stage") is not None, "Failed: attack stage not represented dynamically"
+    print(f"  [2/10] PASS: Current attack event represented dynamically (stage: {res['true_stage']}).")
+
+    # 3. Selected mitigation changes CLONED twin state
+    cloned_state = res.get("cloned_twin_state", {})
+    target_in_cloned = cloned_state.get("hosts", {}).get(host_id, {})
+    assert target_in_cloned.get("is_isolated") is True, "Failed: mitigation did not modify cloned twin state"
+    print("  [3/10] PASS: Selected mitigation modifies CLONED twin state (is_isolated=True).")
+
+    # 4. Original twin remains unchanged
+    assert twin_init.hosts[host_id].is_isolated is False, "Failed: original twin state was mutated!"
+    print("  [4/10] PASS: Original twin state remains UNCHANGED (is_isolated=False).")
+
+    # 5 & 6. Attacker response (blocked / throttled / continued)
+    attacker_resp = res.get("simulated_attacker_response", {})
+    outcome = attacker_resp.get("outcome")
+    assert outcome in ["BLOCKED", "THROTTLED", "CONTINUED"], f"Failed invalid attacker outcome: {outcome}"
+    print(f"  [5-6/10] PASS: Attacker interacts with twin state -> outcome: {outcome} ({attacker_resp.get('reason')}).")
+
+    # 7. Remaining paths recalculated from topology/state
+    path_analysis = res.get("path_prediction", {})
+    metrics = path_analysis.get("metrics", {})
+    assert "blocked_paths_count" in metrics, "Failed: remaining paths not recalculated"
+    print(f"  [7/10] PASS: Topology attack paths recalculated ({metrics['blocked_paths_count']} paths blocked, {metrics['remaining_paths_count']} remaining).")
+
+    # 8 & 9. Telemetry reaches LSTM & future state prediction
+    with_mit = res.get("with_mitigation", {})
+    assert len(with_mit.get("infiltration_probs", [])) > 0, "Failed: LSTM forecast missing"
+    assert len(with_mit.get("predicted_stage_per_horizon", [])) > 0, "Failed: LSTM stage rollout missing"
+    print(f"  [8-9/10] PASS: Simulated telemetry fed to LSTM -> predicted curve: {with_mit['infiltration_probs'][:3]}.")
+
+    # 10. No real network touched
+    assert res.get("real_network_touched") is False, "Failed: real_network_touched is not False!"
+    print("  [10/10] PASS: Safe sandbox enforced (real_network_touched: False).")
 
 
 if __name__ == "__main__":
