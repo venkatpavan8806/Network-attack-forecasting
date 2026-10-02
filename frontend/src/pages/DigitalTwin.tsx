@@ -5,7 +5,7 @@ import CardHeader from '../components/CardHeader';
 import CounterfactualChart, { type CounterfactualPoint } from '../components/CounterfactualChart';
 import DefenseAdvisor from '../components/DefenseAdvisor';
 import TrajectoryPathDiagram from '../components/TrajectoryPathDiagram';
-import { NetworkIcon } from '../icons';
+import { NetworkIcon, ShieldIcon, AlertIcon } from '../icons';
 
 export default function DigitalTwin({ selectedHost, onSelectHost }: { selectedHost: string | null; onSelectHost: (h: string) => void }) {
   const [hosts, setHosts] = useState<string[]>([]);
@@ -34,8 +34,6 @@ export default function DigitalTwin({ selectedHost, onSelectHost }: { selectedHo
     if (!selectedHost || isLive) return;
     api.hostTimeline(selectedHost).then((t) => {
       setTimeline(t);
-      // default to the last window of the first non-benign action run, so the
-      // what-if starts right when something interesting was first observed
       const firstNonBenign = t.find((r) => r.true_stage !== 'benign');
       setWindowIdx(firstNonBenign ? firstNonBenign.window_idx - 1 : t[Math.max(0, t.length - 1)]?.window_idx ?? null);
     }).catch(() => {});
@@ -80,10 +78,6 @@ export default function DigitalTwin({ selectedHost, onSelectHost }: { selectedHo
       }))
     : [];
 
-  // plain-language verdict: what actually changed, in the two ways it can.
-  // probMoved is driven by the same mean-based risk_reduction_pct the
-  // backend's own verdict badge uses (>5%, its "Neutral" cutoff) so the two
-  // never read as disagreeing about the same result.
   const probDeltaPct = result
     ? Math.max(...result.without_mitigation.infiltration_probs.map((p, i) => (p - result.with_mitigation.infiltration_probs[i]) * 100))
     : 0;
@@ -93,32 +87,63 @@ export default function DigitalTwin({ selectedHost, onSelectHost }: { selectedHo
   let verdict: string | null = null;
   if (result) {
     if (probMoved && actionChanged) {
-      verdict = `This mitigation both lowered the predicted infiltration probability (by up to ${probDeltaPct.toFixed(1)} points) and changed what the model expects to happen next.`;
+      verdict = `This mitigation lowered the predicted infiltration probability (by up to ${probDeltaPct.toFixed(1)} points) and altered the attacker's trajectory in the twin state.`;
     } else if (probMoved) {
-      verdict = `This mitigation lowered the predicted infiltration probability by up to ${probDeltaPct.toFixed(1)} points — the model is measurably less alarmed, though it still expects the same next action.`;
+      verdict = `This mitigation lowered predicted infiltration probability by up to ${probDeltaPct.toFixed(1)} points — the simulated state suppressed attack telemetry.`;
     } else if (actionChanged) {
-      verdict = `This mitigation barely moved the overall alarm level — the model is already confident something is wrong at this point in the attack, and one mitigation on its own doesn't undo that. What it DID change is which action the model expects next (see below). That's often the more useful signal once an attack is already this far along.`;
+      verdict = `This mitigation changed the expected next actions on the twin state, although overall risk remains elevated due to prior attack confirmation.`;
     } else {
-      verdict = `This mitigation had no measurable effect here — the model's forecast is the same with or without it. This usually means the attack was already too far along, or too broadly confirmed by other signals, for one targeted mitigation to change the picture. Try applying it earlier (pick an earlier "apply mitigation starting at" option above) to see a bigger effect.`;
+      verdict = `This mitigation had minimal effect at this point — try applying it earlier in the timeline.`;
     }
   }
 
+  const twinState = result?.cloned_twin_state;
+  const attackerResp = result?.simulated_attacker_response;
+  const pathPrediction = result?.path_prediction;
+
   return (
     <div className="flex flex-col gap-6">
+      {/* Top Banner / Conceptual Flow */}
       <div className="card p-6">
-        <CardHeader
-          title="Digital Twin — Model-Based What-If"
-          subtitle="A safe sandbox to test a defense before applying it for real — not a live simulated network."
-        />
-        <div className="rounded-xl bg-[var(--color-accent-soft)] p-4 mb-4 text-xs text-[var(--color-ink)] leading-relaxed">
-          <strong>World model = the brain.</strong> The LSTM (rollout) predicts cause-and-effect over time — given port 22 is open, what's the probability the attacker brute-forces SSH next, versus something else?
-          <br />
-          <strong>Digital twin = the sandbox.</strong> This page asks that same model "what if we acted now?" — e.g. an attacker finds SSH open and starts brute-forcing it; instead of letting every attempt through, we rate-limit or block the port (concretely: cutting allowed connection attempts down to a handful, same idea as your reviewer's "reduce password attempts to 2 or 3") and see how the forecast changes, <em>before</em> touching the real network.
+        <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
+          <CardHeader
+            title="Digital Twin — Safe Sandbox & Network Simulation"
+            subtitle="Simulates network state & attacker interaction before applying defenses for real."
+          />
+          <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-[var(--color-good)]/10 text-[var(--color-good)] text-xs font-semibold border border-[var(--color-good)]/30">
+            <ShieldIcon size={14} />
+            SAFE SANDBOX (real_network_touched: false)
+          </div>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-2">
+        {/* Conceptual Loop Visualization */}
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-2 text-center text-xs mb-5">
+          <div className="p-3 rounded-xl bg-[var(--color-accent-soft)]/50 border border-[var(--color-accent-soft)]">
+            <div className="font-semibold text-[var(--color-ink)] mb-1">1. Live / Observed</div>
+            <div className="text-[var(--color-ink-faint)]">Observed Network State</div>
+          </div>
+          <div className="p-3 rounded-xl bg-[var(--color-accent-soft)]/50 border border-[var(--color-accent-soft)]">
+            <div className="font-semibold text-[var(--color-ink)] mb-1">2. Digital Twin</div>
+            <div className="text-[var(--color-ink-faint)]">Clone Simulated Twin</div>
+          </div>
+          <div className="p-3 rounded-xl bg-[var(--color-accent-soft)]/50 border border-[var(--color-accent-soft)]">
+            <div className="font-semibold text-[var(--color-ink)] mb-1">3. Mitigation</div>
+            <div className="text-[var(--color-ink-faint)]">Apply State Mitigation</div>
+          </div>
+          <div className="p-3 rounded-xl bg-[var(--color-accent-soft)]/50 border border-[var(--color-accent-soft)]">
+            <div className="font-semibold text-[var(--color-ink)] mb-1">4. Sim Response</div>
+            <div className="text-[var(--color-ink-faint)]">Recalculate Paths</div>
+          </div>
+          <div className="p-3 rounded-xl bg-[var(--color-accent-soft)]/50 border border-[var(--color-accent-soft)]">
+            <div className="font-semibold text-[var(--color-ink)] mb-1">5. World Model</div>
+            <div className="text-[var(--color-ink-faint)]">LSTM Trajectory Forecast</div>
+          </div>
+        </div>
+
+        {/* Picker Controls */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div>
-            <label className="text-xs text-[var(--color-ink-faint)] mb-1.5 block">Host</label>
+            <label className="text-xs text-[var(--color-ink-faint)] mb-1.5 block font-medium">Target Host</label>
             <select
               value={selectedHost ?? ''}
               onChange={(e) => onSelectHost(e.target.value)}
@@ -135,10 +160,10 @@ export default function DigitalTwin({ selectedHost, onSelectHost }: { selectedHo
             </select>
           </div>
           <div>
-            <label className="text-xs text-[var(--color-ink-faint)] mb-1.5 block">Apply mitigation starting at</label>
+            <label className="text-xs text-[var(--color-ink-faint)] mb-1.5 block font-medium">Apply Mitigation Starting At</label>
             {isLive ? (
               <div className="w-full px-3 py-2 rounded-xl border border-[var(--color-accent-soft)] text-sm bg-[var(--color-accent-soft)]/40 text-[var(--color-ink-dim)]">
-                now (live hosts only keep their most recent 8 windows)
+                now (live host window)
               </div>
             ) : (
               <select
@@ -155,7 +180,7 @@ export default function DigitalTwin({ selectedHost, onSelectHost }: { selectedHo
             )}
           </div>
           <div>
-            <label className="text-xs text-[var(--color-ink-faint)] mb-1.5 block">Mitigation</label>
+            <label className="text-xs text-[var(--color-ink-faint)] mb-1.5 block font-medium">Defensive Mitigation</label>
             <select
               value={mitigationId}
               onChange={(e) => setMitigationId(e.target.value)}
@@ -165,25 +190,173 @@ export default function DigitalTwin({ selectedHost, onSelectHost }: { selectedHo
             </select>
           </div>
         </div>
+
         {result && (
-          <p className="text-xs text-[var(--color-ink-faint)] mt-2">
-            {mitigations.find((m) => m.id === mitigationId)?.description}
+          <p className="text-xs text-[var(--color-ink-faint)] mt-3">
+            <strong>Selected Mitigation:</strong> {mitigations.find((m) => m.id === mitigationId)?.description}
           </p>
         )}
-        <p className="text-xs text-[var(--color-ink-faint)] mt-2">
-          Tip: applying a mitigation earlier in the attack (e.g. right after Port Scan, before Brute-Force starts) tends to shift both the probability and the predicted next action. Applying it very late (e.g. during C2 or Exfiltration) mostly only shifts which action comes next, since the model is already highly confident something is wrong by then.
-        </p>
       </div>
 
-      {loading && <div className="card p-10 text-center text-sm text-[var(--color-ink-faint)]">running counterfactual rollout…</div>}
+      {loading && <div className="card p-10 text-center text-sm text-[var(--color-ink-faint)]">running safe digital twin sandbox simulation…</div>}
       {error && <div className="card p-6 text-sm text-[var(--color-bad)]">{error}</div>}
 
       {result && !loading && (
         <>
+          {/* Simulated Attacker Response & Twin State Details */}
+          {attackerResp && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              {/* Attacker Response Card */}
+              <div className="card p-6 flex flex-col justify-between">
+                <div>
+                  <CardHeader
+                    title="Simulated Attacker Response"
+                    subtitle="How the attacker's progression reacts to the mitigation on the cloned twin state."
+                  />
+                  <div className="flex items-center gap-3 my-4">
+                    <span className={`text-xs font-bold px-3 py-1.5 rounded-full uppercase tracking-wider ${
+                      attackerResp.outcome === 'BLOCKED' ? 'bg-[var(--color-good)]/15 text-[var(--color-good)] border border-[var(--color-good)]/30' :
+                      attackerResp.outcome === 'THROTTLED' ? 'bg-[var(--color-warn)]/15 text-[var(--color-warn)] border border-[var(--color-warn)]/30' :
+                      'bg-[var(--color-bad)]/15 text-[var(--color-bad)] border border-[var(--color-bad)]/30'
+                    }`}>
+                      {attackerResp.outcome === 'BLOCKED' && <ShieldIcon size={14} className="inline mr-1" />}
+                      {attackerResp.outcome === 'THROTTLED' && <AlertIcon size={14} className="inline mr-1" />}
+                      ATTACK OUTCOME: {attackerResp.outcome}
+                    </span>
+                  </div>
+                  <p className="text-sm text-[var(--color-ink)] leading-relaxed bg-[var(--color-accent-soft)]/40 p-4 rounded-xl border border-[var(--color-accent-soft)]">
+                    {attackerResp.reason}
+                  </p>
+                </div>
+
+                <div className="mt-4 pt-3 border-t border-[var(--color-accent-soft)] flex items-center justify-between text-xs text-[var(--color-ink-faint)]">
+                  <span>Target Asset: <strong>{attackerResp.target_host_id}</strong></span>
+                  <span>Port Affected: <strong>{attackerResp.affected_port ? `Port ${attackerResp.affected_port}` : 'All / ACL'}</strong></span>
+                </div>
+              </div>
+
+              {/* Digital Twin Network State Card */}
+              <div className="card p-6 flex flex-col justify-between">
+                <div>
+                  <CardHeader
+                    title="Digital Twin Network State"
+                    subtitle="Logical state representation of hosts, services, and active firewall rules."
+                  />
+                  {twinState && (
+                    <div className="flex flex-col gap-3 my-3">
+                      <div className="text-xs bg-[var(--color-accent-soft)] p-3 rounded-xl">
+                        <div className="font-semibold text-[var(--color-ink)] mb-1">Simulated Hosts & Services</div>
+                        <div className="grid grid-cols-2 gap-2 text-[var(--color-ink-faint)]">
+                          {Object.values(twinState.hosts).map((h) => (
+                            <div key={h.host_id} className="p-2 bg-white rounded-lg border border-[var(--color-accent-soft)]">
+                              <div className="font-medium text-[var(--color-ink)]">{h.host_id}</div>
+                              <div>IP: {h.ip_address}</div>
+                              <div>Isolation: {h.is_isolated ? <span className="text-[var(--color-good)] font-bold">QUARANTINED</span> : 'Active'}</div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      {twinState.firewall_rules.length > 0 && (
+                        <div className="text-xs bg-[var(--color-accent-soft)]/40 p-3 rounded-xl border border-[var(--color-accent-soft)]">
+                          <div className="font-semibold text-[var(--color-ink)] mb-1">Active Firewall Rules ({twinState.firewall_rules.length})</div>
+                          <div className="text-[var(--color-ink-faint)] flex flex-col gap-1 max-h-24 overflow-y-auto">
+                            {twinState.firewall_rules.map((r, i) => (
+                              <div key={i} className="font-mono text-[11px] bg-white px-2 py-1 rounded border border-[var(--color-accent-soft)]">
+                                [{r.action}] {r.description}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                <div className="text-xs text-[var(--color-ink-faint)] pt-2 border-t border-[var(--color-accent-soft)] flex justify-between">
+                  <span>Data Mode: {isLive ? 'Live Packet Telemetry' : 'Synthetic Data Generator'}</span>
+                  <span>Extensible Adapters: Ready</span>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Topology Path Prediction Card */}
+          {pathPrediction && (
+            <div className="card p-6">
+              <CardHeader
+                title="Topology Path Prediction & Graph Reachability"
+                subtitle="Calculated attack transition graph based on host reachability and firewall policies."
+              />
+
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 my-4">
+                <div className="p-3 rounded-xl bg-[var(--color-accent-soft)]/50 text-center">
+                  <div className="text-xs text-[var(--color-ink-faint)]">Total Potential Paths</div>
+                  <div className="text-lg font-bold text-[var(--color-ink)]">{pathPrediction.metrics.total_paths}</div>
+                </div>
+                <div className="p-3 rounded-xl bg-[var(--color-good)]/10 border border-[var(--color-good)]/30 text-center">
+                  <div className="text-xs text-[var(--color-good)]">Blocked Paths</div>
+                  <div className="text-lg font-bold text-[var(--color-good)]">{pathPrediction.metrics.blocked_paths_count}</div>
+                </div>
+                <div className="p-3 rounded-xl bg-[var(--color-warn)]/10 border border-[var(--color-warn)]/30 text-center">
+                  <div className="text-xs text-[var(--color-warn)]">Remaining Paths</div>
+                  <div className="text-lg font-bold text-[var(--color-warn)]">{pathPrediction.metrics.remaining_paths_count}</div>
+                </div>
+                <div className="p-3 rounded-xl bg-[var(--color-accent-soft)]/50 text-center">
+                  <div className="text-xs text-[var(--color-ink-faint)]">Path Reduction</div>
+                  <div className="text-lg font-bold text-[var(--color-accent)]">{pathPrediction.metrics.reduction_pct}%</div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+                {/* Blocked Paths */}
+                <div className="p-4 rounded-xl bg-[var(--color-good)]/5 border border-[var(--color-good)]/20">
+                  <div className="font-semibold text-[var(--color-good)] mb-2 flex items-center gap-1.5">
+                    <ShieldIcon size={14} />
+                    Blocked Attack Paths ({pathPrediction.blocked_paths.length})
+                  </div>
+                  {pathPrediction.blocked_paths.length > 0 ? (
+                    <div className="flex flex-col gap-1.5 max-h-48 overflow-y-auto">
+                      {pathPrediction.blocked_paths.map((p, i) => (
+                        <div key={i} className="p-2 rounded-lg bg-white border border-[var(--color-good)]/30 text-[var(--color-ink)]">
+                          <div className="font-medium text-[var(--color-good)]">{STAGE_LABELS[p.stage] ?? p.stage} ({p.tactic})</div>
+                          <div className="text-[var(--color-ink-faint)] text-[11px]">{p.reason}</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="text-[var(--color-ink-faint)]">No paths blocked by current state.</div>
+                  )}
+                </div>
+
+                {/* Remaining Open Paths */}
+                <div className="p-4 rounded-xl bg-[var(--color-warn)]/5 border border-[var(--color-warn)]/20">
+                  <div className="font-semibold text-[var(--color-warn)] mb-2 flex items-center gap-1.5">
+                    <AlertIcon size={14} />
+                    Remaining Open Paths ({pathPrediction.remaining_paths.length})
+                  </div>
+                  {pathPrediction.remaining_paths.length > 0 ? (
+                    <div className="flex flex-col gap-1.5 max-h-48 overflow-y-auto">
+                      {pathPrediction.remaining_paths.map((p, i) => (
+                        <div key={i} className="p-2 rounded-lg bg-white border border-[var(--color-warn)]/30 text-[var(--color-ink)]">
+                          <div className="font-medium text-[var(--color-warn)]">{STAGE_LABELS[p.stage] ?? p.stage} ({p.tactic})</div>
+                          <div className="text-[var(--color-ink-faint)] text-[11px]">{p.reason}</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="text-[var(--color-good)] font-medium">All attack paths successfully blocked!</div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* LSTM Forecast Chart */}
           <div className="card p-6">
             <CardHeader
-              title="Predicted Infiltration Probability — With vs. Without Mitigation"
-              subtitle={`${result.host_id}, mitigation applied from window #${result.window_idx} onward (real ground truth at that point: ${STAGE_LABELS[result.true_stage ?? 'benign'] ?? result.true_stage})`}
+              title="Predicted Infiltration Probability — LSTM World Model Forecast"
+              subtitle={`${result.host_id}, mitigation applied on twin state from window #${result.window_idx} onward (observed stage: ${STAGE_LABELS[result.true_stage ?? 'benign'] ?? result.true_stage})`}
             />
             <CounterfactualChart data={chartData} />
           </div>
@@ -191,19 +364,20 @@ export default function DigitalTwin({ selectedHost, onSelectHost }: { selectedHo
           {verdict && (
             <div className={`card p-5 border-l-4 ${probMoved || actionChanged ? 'border-l-[var(--color-accent)]' : 'border-l-[var(--color-ink-faint)]'}`}>
               <div className="flex items-center justify-between gap-3 mb-1.5">
-                <div className="text-xs font-semibold uppercase tracking-wide text-[var(--color-ink-faint)]">In plain terms</div>
+                <div className="text-xs font-semibold uppercase tracking-wide text-[var(--color-ink-faint)]">Simulation Verdict</div>
                 <span className="text-xs font-medium px-2.5 py-1 rounded-full bg-[var(--color-accent-soft)] text-[var(--color-accent)] whitespace-nowrap">
-                  {result.metrics.verdict} · {result.metrics.risk_reduction_pct.toFixed(1)}% mean risk reduction
+                  {result.metrics.verdict} · {result.metrics.risk_reduction_pct.toFixed(1)}% risk reduction
                 </span>
               </div>
               <p className="text-sm text-[var(--color-ink)] leading-relaxed">{verdict}</p>
             </div>
           )}
 
+          {/* Action Divergence / Trajectory Path */}
           <div className="card p-6">
             <CardHeader
-              title="What Changed"
-              subtitle="Points where the predicted next action differs between the two rollouts — this is the main thing to look at when the probability lines above overlap"
+              title="What Changed in Predicted Trajectory"
+              subtitle="Points where the predicted next action differs between the baseline and mitigated state."
             />
             {result.action_divergences.length ? (
               <div className="flex flex-col gap-2">
@@ -219,7 +393,7 @@ export default function DigitalTwin({ selectedHost, onSelectHost }: { selectedHo
             ) : (
               <div className="text-sm text-[var(--color-ink-faint)] py-4 text-center flex items-center justify-center gap-2">
                 <NetworkIcon size={16} />
-                no predicted-action change either — this mitigation made no measurable difference at this point
+                No predicted-action change — mitigation had minimal trajectory shift at this window.
               </div>
             )}
           </div>
@@ -227,7 +401,7 @@ export default function DigitalTwin({ selectedHost, onSelectHost }: { selectedHo
           <div className="card p-6">
             <CardHeader
               title="Predicted Action Path — Without vs. With Mitigation"
-              subtitle="Each node is the model's most-likely next action at that step. Where the two paths agree, the connector is a faint dashed line; where they split, it's solid purple — that's exactly where the mitigation changed the outcome."
+              subtitle="Comparing the LSTM world model's most-likely action sequence step-by-step."
             />
             <TrajectoryPathDiagram
               withoutActions={result.without_mitigation.predicted_stage_per_horizon}
