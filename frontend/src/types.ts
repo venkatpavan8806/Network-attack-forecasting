@@ -216,6 +216,70 @@ export interface CounterfactualMetrics {
   verdict: string;
 }
 
+export interface TwinServiceInfo {
+  port: number;
+  name: string;
+  status: string;
+}
+
+export interface TwinHostInfo {
+  host_id: string;
+  ip_address: string;
+  subnet: string;
+  is_live: boolean;
+  is_isolated: boolean;
+  services: TwinServiceInfo[];
+}
+
+export interface FirewallRuleInfo {
+  rule_id: string;
+  source: string;
+  destination: string;
+  port: number | null;
+  action: string;
+  rate_limit_factor: number;
+  description: string;
+}
+
+export interface TwinNetworkState {
+  real_network_touched: boolean;
+  is_simulated_twin: boolean;
+  hosts: Record<string, TwinHostInfo>;
+  subnets: Record<string, string[]>;
+  firewall_rules: FirewallRuleInfo[];
+}
+
+export interface SimulatedAttackerResponse {
+  outcome: 'BLOCKED' | 'THROTTLED' | 'CONTINUED';
+  reason: string;
+  target_host_id: string;
+  affected_port: number | null;
+}
+
+export interface PathNode {
+  stage: string;
+  tactic: string;
+  technique_id: string | null;
+  technique_name: string | null;
+  target_port: number | null;
+  target_host: string;
+  is_blocked: boolean;
+  reason: string;
+}
+
+export interface PathPrediction {
+  all_paths: PathNode[];
+  blocked_paths: PathNode[];
+  remaining_paths: PathNode[];
+  metrics: {
+    total_paths: number;
+    blocked_paths_count: number;
+    remaining_paths_count: number;
+    reduction_pct: number;
+  };
+  summary: string;
+}
+
 export interface CounterfactualResponse {
   host_id: string;
   window_idx: number;
@@ -227,6 +291,12 @@ export interface CounterfactualResponse {
   metrics: CounterfactualMetrics;
   true_stage: string | null;
   state_label: string | null;
+  real_network_touched?: boolean;
+  is_simulated_twin?: boolean;
+  initial_twin_state?: TwinNetworkState;
+  cloned_twin_state?: TwinNetworkState;
+  simulated_attacker_response?: SimulatedAttackerResponse;
+  path_prediction?: PathPrediction;
 }
 
 export interface LiveInterface {
