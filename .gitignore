@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+backend/venv/
+.pytest_cache/
+
+# Generated data, trained models, and runtime state -- all reproducible via
+# `python -m app.train` (see README). The live-capture SQLite log in
+# particular can contain real captured network metadata (real local IPs,
+# ports, timestamps) from live testing and must never be committed.
+backend/data/*.csv
+backend/data/*.json
+backend/data/*.sqlite3
+backend/models_store/*.pt
+backend/models_store/*.joblib
+backend/models_store/*.json
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Claude Code tooling metadata -- not project source
+.claude/
+
+# Unused scaffold asset (not referenced anywhere in the app)
+frontend/src/assets/hero.png
