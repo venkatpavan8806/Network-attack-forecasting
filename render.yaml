@@ -5,9 +5,13 @@ services:
   - type: web
     name: nadf-backend
     runtime: docker
-    rootDir: backend
     dockerfilePath: ./backend/Dockerfile
     dockerContext: ./backend
+    # only redeploy when backend code changes (the frontend lives on Vercel)
+    buildFilter:
+      paths:
+        - backend/**
+        - render.yaml
     plan: free
     region: singapore
     healthCheckPath: /health
