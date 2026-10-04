@@ -266,3 +266,10 @@ def test_unreachable_database_is_reported_on_health_instead_of_crashing(monkeypa
         assert "pw@" not in body["problem"]  # password never echoed
         assert c.get("/hosts", headers=ALICE).status_code == 503
     db.configure("sqlite://")
+
+
+def test_db_diagnostics_never_echo_any_part_of_the_password():
+    from app import db
+    msg = db.describe_url("postgresql://postgres.abc:Hunter@2006@aws-0-ap-south-1.pooler.supabase.com:5432/postgres")
+    assert "2006" not in msg and "Hunter" not in msg
+    assert "URL-encode" in msg

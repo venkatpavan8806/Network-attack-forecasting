@@ -172,12 +172,14 @@ def describe_url(url: str | None = None) -> str:
         return f"DATABASE_URL is not a valid URL ({e}) -- if the password has @ # / : ? % characters, URL-encode them"
     if u.drivername.startswith("sqlite"):
         return f"sqlite database {u.database}"
-    desc = f"postgres host={u.host} port={u.port} database={u.database} user={u.username}"
     host = u.host or ""
-    if any(c in host for c in "@#/?%: "):
-        desc += (" -- the host looks broken: your password probably contains @ # / : ? % characters; "
-                 "URL-encode them (@ -> %40, # -> %23, / -> %2F) or choose a password with only letters and digits")
-    elif host.startswith("db.") and host.endswith(".supabase.co"):
+    if any(c in host for c in "@#/?%: ") or "@" in (u.username or ""):
+        # never echo the parsed host/user here: with an unencoded @ in the
+        # password, part of the PASSWORD ends up in these fields
+        return ("DATABASE_URL is malformed: the password probably contains @ # / : ? % characters -- "
+                "URL-encode them (@ -> %40, # -> %23, / -> %2F) or choose a password with only letters and digits")
+    desc = f"postgres host={u.host} port={u.port} database={u.database} user={u.username}"
+    if host.startswith("db.") and host.endswith(".supabase.co"):
         desc += (" -- this is Supabase's IPv6-only DIRECT host; use the 'Session pooler' string "
                  "(host aws-N-<region>.pooler.supabase.com) instead")
     elif "pooler.supabase.com" not in host and ".supabase." not in host:
