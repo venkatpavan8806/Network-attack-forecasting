@@ -14,7 +14,18 @@ import { createClient, type Session, type SupabaseClient } from '@supabase/supab
  * so even locally two browsers never share a workspace.
  */
 
-const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL as string | undefined;
+// Accept the project URL in any of the forms the Supabase dashboard shows
+// (".../rest/v1/", trailing slash, ...): the client needs just the origin.
+function projectOrigin(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  try {
+    return new URL(raw.trim()).origin;
+  } catch {
+    return raw.trim().replace(/\/+$/, '');
+  }
+}
+
+const SUPABASE_URL = projectOrigin(import.meta.env.VITE_SUPABASE_URL as string | undefined);
 const SUPABASE_KEY = (import.meta.env.VITE_SUPABASE_ANON_KEY ?? import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY) as string | undefined;
 
 export const supabase: SupabaseClient | null =

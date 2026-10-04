@@ -40,8 +40,19 @@ class AuthConfig:
     problem: str | None = None  # set when the configuration is unusable
 
 
+def _project_origin(raw: str | None) -> str | None:
+    """https://<ref>.supabase.co from any URL form the dashboard shows
+    (".../rest/v1/", trailing slash, ...)."""
+    from urllib.parse import urlsplit
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    parts = urlsplit(raw)
+    return f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else raw.rstrip("/")
+
+
 def load_config() -> AuthConfig:
-    supabase_url = (os.environ.get("SUPABASE_URL") or "").rstrip("/") or None
+    supabase_url = _project_origin(os.environ.get("SUPABASE_URL"))
     secret = os.environ.get("SUPABASE_JWT_SECRET") or None
     mode = os.environ.get("AUTH_MODE") or ("supabase" if supabase_url else "dev")
     problem = None

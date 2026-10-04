@@ -44,7 +44,12 @@ export default function Login() {
     setBusy(true);
     setError(null);
     const { error } = await supabase.auth.signInAnonymously();
-    if (error) setError(`${error.message} (guest access must be enabled in Supabase: Authentication -> Sign In / Providers -> Anonymous)`);
+    if (error) {
+      const disabled = /anonymous/i.test(error.message);
+      setError(disabled
+        ? `${error.message} -- enable it in Supabase: Authentication -> Sign In / Providers -> Anonymous sign-ins`
+        : error.message);
+    }
     setBusy(false);
   }
 
