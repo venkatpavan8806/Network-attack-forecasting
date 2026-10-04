@@ -1,0 +1,16 @@
+# Render Blueprint for the backend API (Dashboard -> New -> Blueprint -> this repo).
+# The website is deployed on Vercel; login is Supabase Auth.
+services:
+  - type: web
+    name: nadf-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free
+    region: singapore
+    healthCheckPath: /health
+    autoDeploy: true
+    buildFilter:
+      paths:
+        - backend/**
+        - render.yaml

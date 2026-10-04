@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+data/*.csv
+data/*.json
+!data/digital_twin_proofs.json
+data/*.sqlite3
+models_store/

@@ -8,7 +8,8 @@ import type {
   ThresholdCalibrationReport, RobustnessReport,
 } from './types';
 
-const client = axios.create({ baseURL: '/api' });
+// Backend URL from VITE_API_URL (e.g. the Render service); locally '/api' is proxied by vite.config.ts.
+const client = axios.create({ baseURL: ((import.meta.env.VITE_API_URL as string | undefined) || '/api').replace(/\/+$/, '') });
 
 export const api = {
   health: () => client.get('/health').then((r) => r.data),

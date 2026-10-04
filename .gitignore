@@ -35,3 +35,11 @@ Thumbs.db
 
 # Unused scaffold asset (not referenced anywhere in the app)
 frontend/src/assets/hero.png
+
+# Environment files (real keys must never be committed)
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
