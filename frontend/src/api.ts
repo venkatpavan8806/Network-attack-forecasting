@@ -7,9 +7,18 @@ import type {
   ShapResponse, DefenseAdvice, BranchingForecastResponse, TrackResponse, StepTrackingReport,
   ThresholdCalibrationReport, RobustnessReport,
 } from './types';
+import { supabase } from './supabase';
 
 // Backend URL from VITE_API_URL (e.g. the Render service); locally '/api' is proxied by vite.config.ts.
 const client = axios.create({ baseURL: ((import.meta.env.VITE_API_URL as string | undefined) || '/api').replace(/\/+$/, '') });
+
+// Send the signed-in user's Supabase token with every request, so the
+// backend returns only that user's own data.
+client.interceptors.request.use(async (config) => {
+  const { data } = (await supabase?.auth.getSession()) ?? { data: { session: null } };
+  if (data.session) config.headers.set('Authorization', `Bearer ${data.session.access_token}`);
+  return config;
+});
 
 export const api = {
   health: () => client.get('/health').then((r) => r.data),

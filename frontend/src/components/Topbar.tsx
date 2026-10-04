@@ -1,6 +1,7 @@
 import { BellIcon, LogIcon } from '../icons';
 import type { TabKey } from '../App';
 import { supabase } from '../supabase';
+import ProfileMenu from './ProfileMenu';
 
 const tabs: { key: TabKey; label: string; disabled?: boolean }[] = [
   { key: 'overview', label: 'Overview' },
@@ -38,9 +39,7 @@ export default function Topbar({ active, onChange }: { active: TabKey; onChange:
           >
             <LogIcon size={17} />
           </button>
-          <div className="w-10 h-10 rounded-full bg-[var(--color-accent)] flex items-center justify-center text-white font-semibold text-sm">
-            SIH
-          </div>
+          <ProfileMenu />
         </div>
       </div>
 

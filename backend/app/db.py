@@ -1,242 +1,342 @@
-"""SQLite-backed inference log. Every row is either seeded from a real
-training-time evaluation run (data/recent_forecast_log.json, produced by
-app/train.py against actual held-out data) or inserted by a live API call
-that actually ran inference. Nothing in this table is fabricated -- the
-"Forecasts Generated (today)" KPI and the "Recent Forecast Log" UI table
-both read straight from it.
+"""Per-user storage (SQLAlchemy Core).
+
+Every row belongs to one user (`user_id` = the Supabase Auth user id) and
+every query filters on it, so each user only ever sees their own data:
+
+  user_windows     the user's own traffic dataset -- a fresh, randomly
+                   generated set of hosts created the first time they sign
+                   in (see InferenceService.ensure_user_data)
+  inference_log    every real inference call (KPIs, "Recent Forecast Log")
+  tripwire_alerts  fast rule-based alerts from a live capture the user started
+
+Backend: Supabase Postgres when DATABASE_URL is set (production), otherwise
+a local SQLite file (development / tests).
 """
 from __future__ import annotations
 
-import json
-import sqlite3
-from contextlib import contextmanager
+import os
 from datetime import datetime, timedelta, timezone
 
-from app.config import DATA_DIR, FORECAST_LOG_JSON
+import pandas as pd
+from sqlalchemy import (
+    JSON, BigInteger, Column, DateTime, Float, Index, Integer, MetaData, String, Table,
+    UniqueConstraint, create_engine, delete, func, insert, select, text,
+)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.engine import Engine
 
-DB_PATH = DATA_DIR / "app_state.sqlite3"
+from app.config import DATA_DIR, FEATURE_COLUMNS
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS inference_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    host_id TEXT NOT NULL,
-    window_idx INTEGER NOT NULL,
-    created_at TEXT NOT NULL,
-    model TEXT NOT NULL,
-    predicted_stage TEXT,
-    infiltration_probability REAL NOT NULL,
-    true_stage TEXT,
-    state_label TEXT,
-    source TEXT NOT NULL DEFAULT 'live'
-);
-CREATE INDEX IF NOT EXISTS idx_inference_created_at ON inference_log(created_at);
-CREATE INDEX IF NOT EXISTS idx_inference_host ON inference_log(host_id);
+_Id = BigInteger().with_variant(Integer, "sqlite")
+_Json = JSON().with_variant(JSONB, "postgresql")
 
-CREATE TABLE IF NOT EXISTS tripwire_alerts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    created_at TEXT NOT NULL,
-    remote_ip TEXT NOT NULL,
-    message TEXT NOT NULL,
-    severity TEXT NOT NULL,
-    detail_json TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_tripwire_created_at ON tripwire_alerts(created_at);
-CREATE INDEX IF NOT EXISTS idx_tripwire_remote_ip ON tripwire_alerts(remote_ip);
-"""
+metadata = MetaData()
+
+user_windows = Table(
+    "user_windows", metadata,
+    Column("id", _Id, primary_key=True, autoincrement=True),
+    Column("user_id", String(64), nullable=False),
+    Column("host_id", String(128), nullable=False),
+    Column("window_idx", Integer, nullable=False),
+    Column("true_stage", String(40)),
+    Column("state_label", String(40)),
+    Column("features", _Json, nullable=False),
+    UniqueConstraint("user_id", "host_id", "window_idx", name="uq_uw_user_host_window"),
+    Index("ix_uw_user", "user_id"),
+)
+
+inference_log = Table(
+    "inference_log", metadata,
+    Column("id", _Id, primary_key=True, autoincrement=True),
+    Column("user_id", String(64), nullable=False),
+    Column("host_id", String(128), nullable=False),
+    Column("window_idx", Integer, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("model", String(32), nullable=False),
+    Column("predicted_stage", String(40)),
+    Column("infiltration_probability", Float, nullable=False),
+    Column("true_stage", String(40)),
+    Column("state_label", String(40)),
+    Column("source", String(16), nullable=False, server_default="live"),
+    Index("ix_il_user_created", "user_id", "created_at"),
+    Index("ix_il_user_host", "user_id", "host_id"),
+)
+
+tripwire_alerts = Table(
+    "tripwire_alerts", metadata,
+    Column("id", _Id, primary_key=True, autoincrement=True),
+    Column("user_id", String(64), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("remote_ip", String(64), nullable=False),
+    Column("message", String(500), nullable=False),
+    Column("severity", String(16), nullable=False),
+    Column("detail", _Json),
+    Index("ix_ta_user", "user_id", "id"),
+)
+
+# ---------------------------------------------------------------------------
+# engine
+# ---------------------------------------------------------------------------
+_engine: Engine | None = None
 
 
-@contextmanager
-def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+def _normalise_url(url: str) -> str:
+    # Supabase gives postgres:// or postgresql:// URLs; SQLAlchemy needs the driver name
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    if url.startswith("postgresql://"):
+        url = "postgresql+psycopg://" + url[len("postgresql://"):]
+    return url
+
+
+def default_url() -> str:
+    return os.environ.get("DATABASE_URL") or f"sqlite:///{(DATA_DIR / 'app_state.sqlite3').as_posix()}"
+
+
+def describe_url(url: str | None = None) -> str:
+    """Database target for logs/health WITHOUT the password, with hints for
+    the usual Supabase connection-string mistakes."""
+    from sqlalchemy.engine import make_url
+    raw = url or default_url()
+    if "[" in raw.split("@")[0]:
+        return "DATABASE_URL still contains the [YOUR-PASSWORD] placeholder -- put the real database password in"
     try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+        u = make_url(_normalise_url(raw))
+    except Exception:
+        return "DATABASE_URL is not a valid URL -- if the password has @ # / : ? % characters, URL-encode them"
+    if u.drivername.startswith("sqlite"):
+        return f"sqlite database {u.database}"
+    host = u.host or ""
+    if any(c in host for c in "@#/?%: ") or "@" in (u.username or ""):
+        # never echo host/user here: with an unencoded @ they contain part of the password
+        return ("DATABASE_URL is malformed: the password probably contains @ # / : ? % characters -- "
+                "URL-encode them (@ -> %40, # -> %23, / -> %2F) or use a password with only letters and digits")
+    desc = f"postgres host={host} port={u.port} database={u.database} user={u.username}"
+    if host.startswith("db.") and host.endswith(".supabase.co"):
+        desc += " -- this is Supabase's IPv6-only direct host; use the 'Session pooler' connection string instead"
+    return desc
+
+
+def configure(url: str | None = None) -> Engine:
+    """(Re)creates the engine; tests call this to use a throwaway database."""
+    global _engine
+    url = _normalise_url(url or default_url())
+    if url.startswith("sqlite"):
+        _engine = create_engine(url, connect_args={"check_same_thread": False})
+    else:
+        _engine = create_engine(url, pool_pre_ping=True, pool_size=5, max_overflow=5, pool_recycle=300)
+    return _engine
+
+
+def engine() -> Engine:
+    if _engine is None:
+        configure()
+    return _engine
 
 
 def init_db():
-    with get_conn() as conn:
-        conn.executescript(SCHEMA)
+    """Creates the tables if missing. On Postgres also enables Row Level
+    Security with no policies, so Supabase's public REST API cannot read
+    them -- only this backend (connected as the database owner) can."""
+    eng = engine()
+    metadata.create_all(eng)
+    if eng.dialect.name == "postgresql":
+        with eng.begin() as conn:
+            for t in metadata.sorted_tables:
+                conn.execute(text(f'ALTER TABLE "{t.name}" ENABLE ROW LEVEL SECURITY'))
 
 
-def log_inference(host_id: str, window_idx: int, model: str, predicted_stage: str | None,
-                   infiltration_probability: float, true_stage: str | None = None,
-                   state_label: str | None = None, source: str = "live"):
-    """Logs one real inference call. Skips the insert if it would be an exact
-    repeat of the immediately-preceding row for this (host_id, model) pair --
-    a demo host's prediction is deterministic (frozen weights, same input),
-    so re-polling it (e.g. the Overview page's 10s refresh) would otherwise
-    flood the 'Recent Forecast Log' / 'Explainability Digest' UI with copies
-    of the same event instead of genuinely new activity. Scoped to `model`
-    too: one forecast call logs both "world_model_lstm" and
-    "baseline_logreg" rows for the same window, so comparing only against
-    the single most recent row (regardless of model) would never match --
-    it would always be the OTHER model's row. A live host's window_idx
-    advances every real window, so its rows are never skipped by this."""
-    with get_conn() as conn:
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _aware(dt):
+    if dt is None:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _iso(dt) -> str | None:
+    dt = _aware(dt)
+    return dt.isoformat() if dt else None
+
+
+# ---------------------------------------------------------------------------
+# the user's own dataset
+# ---------------------------------------------------------------------------
+def user_has_data(user_id: str) -> bool:
+    with engine().connect() as conn:
+        return conn.execute(
+            select(user_windows.c.id).where(user_windows.c.user_id == user_id).limit(1)
+        ).first() is not None
+
+
+def insert_user_windows(user_id: str, df: pd.DataFrame):
+    """df: host_id, window_idx, true_stage, state_label + FEATURE_COLUMNS."""
+    rows = [{
+        "user_id": user_id,
+        "host_id": str(r["host_id"]),
+        "window_idx": int(r["window_idx"]),
+        "true_stage": r.get("true_stage"),
+        "state_label": r.get("state_label"),
+        "features": {c: float(r[c]) for c in FEATURE_COLUMNS},
+    } for r in df.to_dict("records")]
+    with engine().begin() as conn:
+        for i in range(0, len(rows), 500):
+            conn.execute(insert(user_windows), rows[i:i + 500])
+
+
+def user_frame(user_id: str) -> pd.DataFrame:
+    """All of the user's windows as a DataFrame shaped like the training
+    dataset (host_id, window_idx, true_stage, state_label, FEATURE_COLUMNS)."""
+    uw = user_windows
+    with engine().connect() as conn:
+        rows = conn.execute(
+            select(uw.c.host_id, uw.c.window_idx, uw.c.true_stage, uw.c.state_label, uw.c.features)
+            .where(uw.c.user_id == user_id).order_by(uw.c.host_id, uw.c.window_idx)
+        ).mappings().all()
+    records = []
+    for r in rows:
+        rec = {"host_id": r["host_id"], "window_idx": r["window_idx"],
+               "true_stage": r["true_stage"], "state_label": r["state_label"]}
+        feats = r["features"] or {}
+        for c in FEATURE_COLUMNS:
+            rec[c] = float(feats.get(c, 0.0))
+        records.append(rec)
+    return pd.DataFrame(records, columns=["host_id", "window_idx", "true_stage", "state_label"] + FEATURE_COLUMNS)
+
+
+# ---------------------------------------------------------------------------
+# inference log
+# ---------------------------------------------------------------------------
+def log_inference(user_id: str, host_id: str, window_idx: int, model: str, predicted_stage: str | None,
+                  infiltration_probability: float, true_stage: str | None = None,
+                  state_label: str | None = None, source: str = "live"):
+    """Logs one real inference call for this user. Skips an exact repeat of
+    the previous row for this (user, host, model) -- a demo host's
+    prediction is deterministic, so re-polling it (e.g. the Overview page's
+    10 s refresh) must not flood the log with copies. A live host's
+    window_idx advances every window, so its rows are never skipped."""
+    il = inference_log
+    with engine().begin() as conn:
         last = conn.execute(
-            "SELECT window_idx, predicted_stage, infiltration_probability, source "
-            "FROM inference_log WHERE host_id = ? AND model = ? ORDER BY id DESC LIMIT 1",
-            (host_id, model),
-        ).fetchone()
-        if (last is not None and last["window_idx"] == window_idx
-                and last["predicted_stage"] == predicted_stage and last["source"] == source
+            select(il.c.window_idx, il.c.predicted_stage, il.c.infiltration_probability, il.c.source)
+            .where(il.c.user_id == user_id, il.c.host_id == host_id, il.c.model == model)
+            .order_by(il.c.id.desc()).limit(1)
+        ).mappings().first()
+        if (last is not None and last["window_idx"] == window_idx and last["predicted_stage"] == predicted_stage
+                and last["source"] == source
                 and abs(last["infiltration_probability"] - float(infiltration_probability)) < 1e-9):
             return
-        conn.execute(
-            "INSERT INTO inference_log (host_id, window_idx, created_at, model, predicted_stage, "
-            "infiltration_probability, true_stage, state_label, source) VALUES (?,?,?,?,?,?,?,?,?)",
-            (host_id, window_idx, datetime.now(timezone.utc).isoformat(), model, predicted_stage,
-             float(infiltration_probability), true_stage, state_label, source),
-        )
+        conn.execute(insert(il).values(
+            user_id=user_id, host_id=host_id, window_idx=int(window_idx), created_at=_now(), model=model,
+            predicted_stage=predicted_stage, infiltration_probability=float(infiltration_probability),
+            true_stage=true_stage, state_label=state_label, source=source,
+        ))
 
 
-def seed_from_training_log(force: bool = False):
-    """Loads app/train.py's recent_forecast_log.json (real held-out
-    predictions from both models) into the DB so the demo isn't empty on
-    first boot. Skipped if the table already has seeded rows, unless force."""
-    with get_conn() as conn:
-        existing = conn.execute("SELECT COUNT(*) as c FROM inference_log WHERE source='seed'").fetchone()["c"]
-        if existing > 0 and not force:
-            return 0
-
-    if not FORECAST_LOG_JSON.exists():
-        return 0
-    with open(FORECAST_LOG_JSON) as f:
-        rows = json.load(f)
-
-    count = 0
-    for r in rows:
-        log_inference(r["host_id"], r["window_idx"], "world_model_lstm", r["predicted_stage"],
-                       r["infiltration_probability_world_model"], r["true_stage"], r["state_label"], source="seed")
-        log_inference(r["host_id"], r["window_idx"], "baseline_logreg", None,
-                       r["infiltration_probability_baseline"], r["true_stage"], r["state_label"], source="seed")
-        count += 2
-    return count
+def count_forecasts_today(user_id: str) -> int:
+    start = _now().replace(hour=0, minute=0, second=0, microsecond=0)
+    with engine().connect() as conn:
+        return int(conn.execute(
+            select(func.count()).select_from(inference_log)
+            .where(inference_log.c.user_id == user_id, inference_log.c.created_at >= start)
+        ).scalar() or 0)
 
 
-def count_forecasts_today() -> int:
-    today = datetime.now(timezone.utc).date().isoformat()
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) as c FROM inference_log WHERE substr(created_at,1,10) = ?", (today,)
-        ).fetchone()
-        return int(row["c"])
-
-
-# "Currently" high-risk means recently high-risk for a CONTINUOUS MONITOR
-# -- a live-capture flag from an hour ago must not permanently occupy
-# "highest risk right now" just because nothing newer has been logged for
-# that host since (a real host stops appearing once its traffic is no
-# longer flagged, e.g. after the flow_tracker fix removed a false
-# positive -- its last, stale log row must not linger forever). Live
-# capture hosts refresh every WINDOW_SECONDS (30s) while running, so 15
-# minutes of silence is a reasonable staleness cutoff. This does NOT apply
-# to seed/ingest rows (source != 'live_capture') -- those are fixed
-# reference results from a specific run (the CSV-replay demo benchmark or
-# an explicit /ingest call), not a claim about what is happening right
-# now, so they are not expected to keep refreshing and should not age out.
+# "Currently" high-risk means recently high-risk for a continuous monitor: a
+# live-capture flag older than this no longer counts as "right now". Rows
+# from the demo dataset / CSV ingest are fixed reference results and do not
+# age out.
 RECENCY_WINDOW_MINUTES = 15
 
 
-def _recency_cutoff_iso() -> str:
-    return (datetime.now(timezone.utc) - timedelta(minutes=RECENCY_WINDOW_MINUTES)).isoformat()
-
-
-def count_high_risk_hosts(threshold: float = 0.5) -> int:
-    """Hosts whose MOST RECENT world-model log row is above threshold --
-    live-capture rows older than the recency window are excluded."""
-    cutoff = _recency_cutoff_iso()
-    with get_conn() as conn:
+def _latest_world_model_rows(user_id: str):
+    il = inference_log
+    cutoff = _now() - timedelta(minutes=RECENCY_WINDOW_MINUTES)
+    with engine().connect() as conn:
         rows = conn.execute(
-            "SELECT host_id, infiltration_probability, created_at FROM inference_log "
-            "WHERE model='world_model_lstm' AND (source != 'live_capture' OR created_at >= ?) "
-            "ORDER BY created_at DESC",
-            (cutoff,),
-        ).fetchall()
-    seen = set()
-    count = 0
+            select(il.c.host_id, il.c.window_idx, il.c.predicted_stage, il.c.infiltration_probability,
+                   il.c.created_at)
+            .where(il.c.user_id == user_id, il.c.model == "world_model_lstm",
+                   (il.c.source != "live_capture") | (il.c.created_at >= cutoff))
+            .order_by(il.c.created_at.desc(), il.c.id.desc())
+        ).mappings().all()
+    latest = {}
     for r in rows:
-        if r["host_id"] in seen:
-            continue
-        seen.add(r["host_id"])
-        if r["infiltration_probability"] >= threshold:
-            count += 1
-    return count
+        if r["host_id"] not in latest:
+            latest[r["host_id"]] = r
+    return latest
 
 
-def highest_risk_host():
-    cutoff = _recency_cutoff_iso()
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT host_id, window_idx, predicted_stage, infiltration_probability, created_at FROM inference_log "
-            "WHERE model='world_model_lstm' AND (source != 'live_capture' OR created_at >= ?) "
-            "ORDER BY created_at DESC",
-            (cutoff,),
-        ).fetchall()
-    latest_per_host = {}
-    for r in rows:
-        if r["host_id"] not in latest_per_host:
-            latest_per_host[r["host_id"]] = r
-    if not latest_per_host:
+def count_high_risk_hosts(user_id: str, threshold: float = 0.5) -> int:
+    return sum(1 for r in _latest_world_model_rows(user_id).values() if r["infiltration_probability"] >= threshold)
+
+
+def highest_risk_host(user_id: str):
+    latest = _latest_world_model_rows(user_id)
+    if not latest:
         return None
-    best = max(latest_per_host.values(), key=lambda r: r["infiltration_probability"])
-    return dict(best)
+    best = max(latest.values(), key=lambda r: r["infiltration_probability"])
+    return {**dict(best), "created_at": _iso(best["created_at"])}
 
 
-def recent_forecast_log(limit: int = 25):
-    with get_conn() as conn:
+def recent_forecast_log(user_id: str, limit: int = 25):
+    il = inference_log
+    with engine().connect() as conn:
         rows = conn.execute(
-            "SELECT host_id, window_idx, created_at, model, predicted_stage, infiltration_probability, "
-            "true_stage, state_label FROM inference_log ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall()
-    return [dict(r) for r in rows]
+            select(il.c.host_id, il.c.window_idx, il.c.created_at, il.c.model, il.c.predicted_stage,
+                   il.c.infiltration_probability, il.c.true_stage, il.c.state_label)
+            .where(il.c.user_id == user_id).order_by(il.c.id.desc()).limit(limit)
+        ).mappings().all()
+    return [{**dict(r), "created_at": _iso(r["created_at"])} for r in rows]
 
 
-def stage_breakdown(limit: int = 500):
-    """Share of recent world-model windows classified into each stage."""
-    with get_conn() as conn:
+def stage_breakdown(user_id: str, limit: int = 500):
+    """Share of the user's recent world-model windows classified into each stage."""
+    il = inference_log
+    with engine().connect() as conn:
         rows = conn.execute(
-            "SELECT predicted_stage FROM inference_log WHERE model='world_model_lstm' "
-            "AND predicted_stage IS NOT NULL ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall()
-    total = len(rows)
+            select(il.c.predicted_stage).where(
+                il.c.user_id == user_id, il.c.model == "world_model_lstm", il.c.predicted_stage.isnot(None))
+            .order_by(il.c.id.desc()).limit(limit)
+        ).all()
     counts: dict[str, int] = {}
-    for r in rows:
-        counts[r["predicted_stage"]] = counts.get(r["predicted_stage"], 0) + 1
-    return {"total": total, "counts": counts}
+    for (stage,) in rows:
+        counts[stage] = counts.get(stage, 0) + 1
+    return {"total": len(rows), "counts": counts}
 
 
-def log_tripwire_alert(remote_ip: str, message: str, severity: str, detail: dict) -> dict:
-    """Persists a fast rule-based tripwire alert (see app/live/tripwire.py).
-    Unlike inference_log rows, these are never wiped on capture restart --
-    they're a genuine event log, not per-session state."""
-    created_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-    with get_conn() as conn:
-        cur = conn.execute(
-            "INSERT INTO tripwire_alerts (created_at, remote_ip, message, severity, detail_json) VALUES (?,?,?,?,?)",
-            (created_at, remote_ip, message, severity, json.dumps(detail)),
-        )
-        alert_id = cur.lastrowid
-    return {"id": alert_id, "timestamp": created_at, "remote_ip": remote_ip, "message": message, "severity": severity, "detail": detail}
+# ---------------------------------------------------------------------------
+# tripwire alerts
+# ---------------------------------------------------------------------------
+def log_tripwire_alert(user_id: str, remote_ip: str, message: str, severity: str, detail: dict) -> dict:
+    """Persists a fast rule-based tripwire alert (see app/live/tripwire.py)
+    for the user who started the live capture."""
+    created_at = _now()
+    with engine().begin() as conn:
+        res = conn.execute(insert(tripwire_alerts).values(
+            user_id=user_id, created_at=created_at, remote_ip=remote_ip, message=message[:500],
+            severity=severity, detail=detail,
+        ))
+        alert_id = res.inserted_primary_key[0]
+    return {"id": alert_id, "timestamp": created_at.isoformat(timespec="milliseconds"), "remote_ip": remote_ip,
+            "message": message, "severity": severity, "detail": detail}
 
 
-def recent_tripwire_alerts(limit: int = 50) -> list[dict]:
-    with get_conn() as conn:
+def recent_tripwire_alerts(user_id: str, limit: int = 50) -> list[dict]:
+    ta = tripwire_alerts
+    with engine().connect() as conn:
         rows = conn.execute(
-            "SELECT id, created_at, remote_ip, message, severity, detail_json FROM tripwire_alerts "
-            "ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall()
-    return [
-        {
-            "id": r["id"],
-            "timestamp": r["created_at"],
-            "remote_ip": r["remote_ip"],
-            "message": r["message"],
-            "severity": r["severity"],
-            "detail": json.loads(r["detail_json"]) if r["detail_json"] else {},
-        }
-        for r in rows
-    ]
+            select(ta).where(ta.c.user_id == user_id).order_by(ta.c.id.desc()).limit(limit)
+        ).mappings().all()
+    return [{"id": r["id"], "timestamp": _aware(r["created_at"]).isoformat(timespec="milliseconds"),
+             "remote_ip": r["remote_ip"], "message": r["message"], "severity": r["severity"],
+             "detail": r["detail"] or {}} for r in rows]
+
+
+def delete_user(user_id: str):
+    """Removes everything stored for one user (used by tests)."""
+    with engine().begin() as conn:
+        for t in (user_windows, inference_log, tripwire_alerts):
+            conn.execute(delete(t).where(t.c.user_id == user_id))

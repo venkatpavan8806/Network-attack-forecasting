@@ -39,6 +39,7 @@ FULL_HISTORY_MAX = 1000  # windows kept per remote IP for step-by-step tracking
 class LiveCaptureManager:
     def __init__(self):
         self.running = False
+        self.owner: str | None = None  # user who started this capture; only they see its results
         self.iface: str | None = None
         self.local_ip: str | None = None
         self.tracker: FlowTracker | None = None
@@ -65,9 +66,10 @@ class LiveCaptureManager:
             "error": self.error,
         }
 
-    def start(self, iface: str, local_ip: str):
+    def start(self, iface: str, local_ip: str, owner: str | None = None):
         if self.running:
             raise RuntimeError("live capture is already running")
+        self.owner = owner
         self.iface = iface
         self.local_ip = local_ip
         self.tracker = FlowTracker(local_ip)
@@ -78,6 +80,7 @@ class LiveCaptureManager:
         self.error = None
         self.recent_predictions.clear()  # a fresh session must not mix in a previous session's log entries
         tripwire.reset()
+        tripwire.owner = owner
         self.running = True
         self.started_at = datetime.now(timezone.utc).isoformat()
 
@@ -195,10 +198,11 @@ class LiveCaptureManager:
                     "top_contributors": explanation["top_contributors"],
                 }
 
-                db.log_inference(host_id, window_idx, "world_model_lstm", predicted_stage,
-                                  explanation["infiltration_probability"], None, None, source="live_capture")
-                db.log_inference(host_id, window_idx, "baseline_logreg", None,
-                                  baseline_prob, None, None, source="live_capture")
+                if self.owner is not None:
+                    db.log_inference(self.owner, host_id, window_idx, "world_model_lstm", predicted_stage,
+                                     explanation["infiltration_probability"], None, None, source="live_capture")
+                    db.log_inference(self.owner, host_id, window_idx, "baseline_logreg", None,
+                                     baseline_prob, None, None, source="live_capture")
 
             self.recent_predictions.append(entry)
 

@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from fastapi.testclient import TestClient
 
 from app import db
-from app.config import N_FEATURES, SEQ_LEN, STAGE_CLASSES
+from app.config import FEATURE_COLUMNS, N_FEATURES, SEQ_LEN, STAGE_CLASSES
 from app.data_gen.generator import generate_dataset
 from app.labeling.state_labeler import derive_state_labels
 from app.features.extraction import host_split, fit_scaler, build_sequences, build_single_window_table
@@ -79,8 +79,9 @@ def client(real_service, tmp_path, monkeypatch):
     module-level `service` it dispatches to swapped for our fast, real,
     already-trained one, and the DB pointed at a throwaway file."""
     monkeypatch.setattr(main_module, "service", real_service)
-    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test_api_state.sqlite3")
+    db.configure(f"sqlite:///{(tmp_path / 'test_api_state.sqlite3').as_posix()}")
     db.init_db()
+    real_service._user_cache.clear()
     return TestClient(main_module.app)
 
 
@@ -91,7 +92,7 @@ def _demo_host_id(real_service) -> str:
 def test_health_reports_ready(client):
     r = client.get("/health")
     assert r.status_code == 200
-    assert r.json() == {"status": "ok", "ready": True}
+    assert r.json() == {"status": "ok", "ready": True, "problem": None}
 
 
 def test_hosts_lists_real_hosts(client, real_service):
@@ -199,3 +200,39 @@ def test_threshold_calibration_route_404s_honestly_when_not_yet_computed(client,
     r = client.get("/threshold-calibration")
     assert r.status_code == 404
     assert "not yet computed" in r.json()["detail"]
+
+
+def test_each_user_gets_their_own_fresh_dataset(real_service, tmp_path):
+    """Two accounts get different, independently generated traffic."""
+    db.configure(f"sqlite:///{(tmp_path / 'users.sqlite3').as_posix()}")
+    db.init_db()
+    real_service._user_cache.clear()
+    a = real_service.user_df("alice")
+    b = real_service.user_df("bob")
+    assert len(a) > 0 and len(b) > 0
+    assert not a[FEATURE_COLUMNS].head(50).equals(b[FEATURE_COLUMNS].head(50))
+    assert real_service.user_df("alice").equals(a)  # same user -> same data on later requests
+    assert len(db.recent_forecast_log("alice", limit=500)) > 0  # starts with their own forecasts
+    assert all(r["host_id"] in set(a["host_id"]) for r in db.recent_forecast_log("alice", limit=500))
+
+
+def test_backend_rejects_requests_without_a_login(client, monkeypatch):
+    from app import auth
+    monkeypatch.setattr(auth, "DEV_MODE", False)
+    monkeypatch.setattr(auth, "SUPABASE_URL", "https://example.supabase.co")
+    assert client.get("/hosts").status_code == 401
+    assert client.get("/hosts", headers={"Authorization": "Bearer not-a-real-token"}).status_code == 401
+
+
+def test_backend_accepts_a_valid_supabase_token(client, monkeypatch):
+    import jwt
+    from datetime import datetime, timedelta, timezone
+    from app import auth
+    monkeypatch.setattr(auth, "DEV_MODE", False)
+    monkeypatch.setattr(auth, "SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setattr(auth, "JWT_SECRET", "test-secret-test-secret-test-secret")
+    token = jwt.encode({"sub": "user-1", "aud": "authenticated",
+                        "exp": datetime.now(timezone.utc) + timedelta(minutes=5)},
+                       "test-secret-test-secret-test-secret", algorithm="HS256")
+    r = client.get("/hosts", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 200 and len(r.json()) > 0

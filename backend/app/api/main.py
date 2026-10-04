@@ -9,14 +9,15 @@ import io
 
 import pandas as pd
 # pyrefly: ignore [missing-import]
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import Depends, FastAPI, UploadFile, File, HTTPException
 # pyrefly: ignore [missing-import]
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app.inference.service import service, ArtifactsNotReadyError
 from app.models.attack_mapping import all_mappings
-from app import db
+from app import auth, db
+from app.auth import current_user
 from app.config import STAGE_CLASSES
 from app.live.capture import live_capture
 from app.live.tripwire import tripwire
@@ -31,44 +32,59 @@ app.add_middleware(
 )
 
 
+STARTUP_PROBLEM: str | None = None
+
+
 @app.on_event("startup")
 def startup():
+    global STARTUP_PROBLEM
+    target = db.describe_url()
+    print(f"[startup] database: {target}")
     try:
+        db.configure()
         service.load()
     except ArtifactsNotReadyError as e:
         # Server still starts so /health reports the real reason instead of crashing silently.
+        STARTUP_PROBLEM = str(e)
         print(f"[startup] {e}")
+    except Exception as e:  # e.g. database unreachable / wrong DATABASE_URL
+        first_line = str(e).splitlines()[0][:300] if str(e) else type(e).__name__
+        STARTUP_PROBLEM = f"database connection failed: {first_line} [{target}]"
+        print(f"[startup] {STARTUP_PROBLEM}")
 
 
 def _require_ready():
     if not service.ready:
         raise HTTPException(
             status_code=503,
-            detail="Model artifacts not trained yet. Run `python -m app.train` in the backend directory, then restart the API.",
+            detail=STARTUP_PROBLEM or "Model artifacts not trained yet. Run `python -m app.train` in the backend directory, then restart the API.",
         )
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok" if service.ready else "not_ready", "ready": service.ready}
+    problem = STARTUP_PROBLEM or auth.PROBLEM
+    return {"status": "ok" if service.ready and not problem else "not_ready", "ready": service.ready,
+            "problem": problem}
 
 
 @app.get("/kpis")
-def kpis():
+def kpis(user: str = Depends(current_user)):
     _require_ready()
     lead_time = service.lead_time_report() or {}
     return {
-        "hosts_monitored": len(service.list_demo_hosts()),
-        "forecasts_generated_today": db.count_forecasts_today(),
-        "high_risk_trajectories": db.count_high_risk_hosts(threshold=0.5),
+        "hosts_monitored": len(service.list_demo_hosts(user)),
+        "forecasts_generated_today": db.count_forecasts_today(user),
+        "high_risk_trajectories": db.count_high_risk_hosts(user, threshold=0.5),
         "median_lead_time_minutes": lead_time.get("median_lead_time_minutes_all_hosts"),
     }
 
 
 @app.get("/highest-risk-host")
-def highest_risk_host():
+def highest_risk_host(user: str = Depends(current_user)):
     _require_ready()
-    row = db.highest_risk_host()
+    service.ensure_user_data(user)
+    row = db.highest_risk_host(user)
     if row is None:
         return None
     mapping = None
@@ -82,49 +98,49 @@ def highest_risk_host():
 
 
 @app.get("/hosts")
-def hosts():
+def hosts(user: str = Depends(current_user)):
     _require_ready()
-    return service.list_demo_hosts()
+    return service.list_demo_hosts(user)
 
 
 @app.get("/live/forecastable-hosts")
-def live_forecastable_hosts():
+def live_forecastable_hosts(user: str = Depends(current_user)):
     """Live-captured hosts with enough window history (>= SEQ_LEN) to be
     forecastable right now -- i.e. eligible for Explainability and Digital
     Twin, not just the Live Capture table's own building-history view."""
     _require_ready()
-    return service.live_hosts_with_predictions()
+    return service.live_hosts_with_predictions(user)
 
 
 @app.get("/forecast/{host_id}")
-def forecast(host_id: str, at_window_idx: int | None = None):
+def forecast(host_id: str, at_window_idx: int | None = None, user: str = Depends(current_user)):
     _require_ready()
     try:
-        return service.forecast_demo_host(host_id, at_window_idx=at_window_idx)
+        return service.forecast_demo_host(user, host_id, at_window_idx=at_window_idx)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
 
 @app.get("/forecast/{host_id}/branches")
 def forecast_branches(host_id: str, at_window_idx: int | None = None,
-                       depth: int | None = None, branch_factor: int | None = None):
+                       depth: int | None = None, branch_factor: int | None = None, user: str = Depends(current_user)):
     """K-step forecast as a branching attack-path tree, each node MITRE-mapped
     -- see app/inference/service.py:branching_forecast."""
     _require_ready()
     try:
-        return service.branching_forecast(host_id, at_window_idx=at_window_idx, depth=depth, branch_factor=branch_factor)
+        return service.branching_forecast(user, host_id, at_window_idx=at_window_idx, depth=depth, branch_factor=branch_factor)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
 
 @app.get("/track/{host_id}")
-def track_attacker(host_id: str, at_window_idx: int | None = None):
+def track_attacker(host_id: str, at_window_idx: int | None = None, user: str = Depends(current_user)):
     """Step-by-step attacker tracking: a next-step prediction after EVERY
     window from the host's first one, the attack path recognised so far, and
     the next 1/2/3 moves -- see app/tracking/step_tracker.py."""
     _require_ready()
     try:
-        return service.track_attacker(host_id, at_window_idx=at_window_idx)
+        return service.track_attacker(user, host_id, at_window_idx=at_window_idx)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -141,13 +157,12 @@ def step_tracking_report():
 
 
 @app.get("/host-timeline/{host_id}")
-def host_timeline(host_id: str):
+def host_timeline(host_id: str, user: str = Depends(current_user)):
     """Windows + ground-truth action for one host -- lets the UI offer
     'jump to when port_scan/bruteforce/etc started' instead of only 'now'."""
     _require_ready()
-    if service.labeled_df is None:
-        raise HTTPException(status_code=404, detail="no dataset loaded")
-    host_df = service.labeled_df[service.labeled_df["host_id"] == host_id].sort_values("window_idx")
+    df = service.user_df(user)
+    host_df = df[df["host_id"] == host_id].sort_values("window_idx")
     if len(host_df) == 0:
         raise HTTPException(status_code=404, detail=f"unknown host_id: {host_id}")
     return host_df[["window_idx", "true_stage", "state_label"]].to_dict("records")
@@ -160,13 +175,14 @@ def mitigations():
 
 
 @app.get("/counterfactual/{host_id}")
-def counterfactual(host_id: str, mitigation_id: str = "isolate_host", at_window_idx: int | None = None):
+def counterfactual(host_id: str, mitigation_id: str = "isolate_host", at_window_idx: int | None = None,
+                   user: str = Depends(current_user)):
     """Digital-twin what-if: compares the world model's predicted
     trajectory with vs. without a named mitigation applied to the cloned
     Digital Twin network state. Safe sandbox simulation -- real_network_touched: false."""
     _require_ready()
     try:
-        return service.run_counterfactual(host_id, mitigation_id, at_window_idx=at_window_idx)
+        return service.run_counterfactual(user, host_id, mitigation_id, at_window_idx=at_window_idx)
     except ValueError as e:
         raise HTTPException(status_code=404 if "unknown host_id" in str(e) else 400, detail=str(e))
 
@@ -178,7 +194,7 @@ class DigitalTwinSimulateRequest(BaseModel):
 
 
 @app.get("/digital-twin/state/{host_id}")
-def digital_twin_state(host_id: str):
+def digital_twin_state(host_id: str, user: str = Depends(current_user)):
     """Returns the current logical Digital Twin network state, services, and firewall policy."""
     _require_ready()
     try:
@@ -190,23 +206,23 @@ def digital_twin_state(host_id: str):
 
 
 @app.post("/digital-twin/simulate")
-def digital_twin_simulate(req: DigitalTwinSimulateRequest):
+def digital_twin_simulate(req: DigitalTwinSimulateRequest, user: str = Depends(current_user)):
     """Runs a safe sandbox simulation on a cloned Digital Twin network state."""
     _require_ready()
     try:
-        return service.run_counterfactual(req.host_id, req.mitigation_id, at_window_idx=req.at_window_idx)
+        return service.run_counterfactual(user, req.host_id, req.mitigation_id, at_window_idx=req.at_window_idx)
     except ValueError as e:
         raise HTTPException(status_code=404 if "unknown host_id" in str(e) else 400, detail=str(e))
 
 
 @app.get("/shap/{host_id}")
-def shap_explanation(host_id: str, at_window_idx: int | None = None):
+def shap_explanation(host_id: str, at_window_idx: int | None = None, user: str = Depends(current_user)):
     """SHAP on the baseline next to attention + saliency on the LSTM, for the
     same host/window. Works for demo hosts and for `live:<ip>` hosts from the
     live capture. See app/explain/shap_baseline.py and app/explain/attention.py."""
     _require_ready()
     try:
-        return service.explain_shap(host_id, at_window_idx=at_window_idx)
+        return service.explain_shap(user, host_id, at_window_idx=at_window_idx)
     except ValueError as e:
         raise HTTPException(status_code=404 if "unknown host_id" in str(e) else 400, detail=str(e))
     except ArtifactsNotReadyError as e:
@@ -214,14 +230,14 @@ def shap_explanation(host_id: str, at_window_idx: int | None = None):
 
 
 @app.get("/defense/{host_id}")
-def defense_advice(host_id: str, at_window_idx: int | None = None):
+def defense_advice(host_id: str, at_window_idx: int | None = None, user: str = Depends(current_user)):
     """Ranked defensive recommendation computed from real counterfactual
     rollouts of the trained world model (every mitigation vs. no mitigation),
     plus the ATT&CK-mapped manual playbook for the stage the model expects.
     Decision support only -- nothing is applied to any network."""
     _require_ready()
     try:
-        return service.defense_advice(host_id, at_window_idx=at_window_idx)
+        return service.defense_advice(user, host_id, at_window_idx=at_window_idx)
     except ValueError as e:
         raise HTTPException(status_code=404 if "unknown host_id" in str(e) else 400, detail=str(e))
     except ArtifactsNotReadyError as e:
@@ -236,7 +252,7 @@ class SandboxTestResponse(BaseModel):
 
 
 @app.post("/sandbox/test", response_model=SandboxTestResponse)
-async def sandbox_test(file: UploadFile = File(...)):
+async def sandbox_test(file: UploadFile = File(...), user: str = Depends(current_user)):
     """Genuinely validates the uploaded CSV and can return outcome="failure"
     when the input actually warrants it (malformed columns, too few windows
     per host, non-numeric feature values, etc.) -- see app/inference/service.py:validate_telemetry_csv.
@@ -255,7 +271,7 @@ async def sandbox_test(file: UploadFile = File(...)):
 
 
 @app.post("/ingest")
-async def ingest(file: UploadFile = File(...)):
+async def ingest(file: UploadFile = File(...), user: str = Depends(current_user)):
     """Real CSV ingestion: parses the uploaded file, runs actual inference
     for the last window of every host present, logs results, and returns
     them. Raises 422 on genuinely malformed input rather than silently
@@ -267,22 +283,24 @@ async def ingest(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"could not parse CSV: {e}")
     try:
-        results = service.ingest_csv(df)
+        results = service.ingest_csv(user, df)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     return results
 
 
 @app.get("/attack-stage-breakdown")
-def attack_stage_breakdown():
+def attack_stage_breakdown(user: str = Depends(current_user)):
     _require_ready()
-    return db.stage_breakdown()
+    service.ensure_user_data(user)
+    return db.stage_breakdown(user)
 
 
 @app.get("/forecast-log")
-def forecast_log(limit: int = 25):
+def forecast_log(limit: int = 25, user: str = Depends(current_user)):
     _require_ready()
-    return db.recent_forecast_log(limit=limit)
+    service.ensure_user_data(user)
+    return db.recent_forecast_log(user, limit=limit)
 
 
 @app.get("/attack-mapping")
@@ -380,48 +398,59 @@ def live_interfaces():
 
 
 @app.post("/live/start")
-def live_start(req: LiveStartRequest):
+def live_start(req: LiveStartRequest, user: str = Depends(current_user)):
     _require_ready()
     try:
-        live_capture.start(req.iface, req.local_ip)
+        live_capture.start(req.iface, req.local_ip, owner=user)
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
     return live_capture.status()
 
 
+def _live_status_for(user: str) -> dict:
+    status = live_capture.status()
+    if live_capture.owner != user:
+        status = {**status, "running": False, "packets_seen": 0, "hosts_seen": 0, "error": None}
+    return status
+
+
 @app.post("/live/stop")
-def live_stop():
+def live_stop(user: str = Depends(current_user)):
+    if live_capture.running and live_capture.owner != user:
+        raise HTTPException(status_code=409, detail="this live capture was started by another user")
     live_capture.stop()
-    return live_capture.status()
+    return _live_status_for(user)
 
 
 @app.get("/live/status")
-def live_status():
-    return live_capture.status()
+def live_status(user: str = Depends(current_user)):
+    return _live_status_for(user)
 
 
 @app.get("/live/recent")
-def live_recent(limit: int = 50):
+def live_recent(limit: int = 50, user: str = Depends(current_user)):
+    if live_capture.owner != user:
+        return []
     items = list(live_capture.recent_predictions)[-limit:]
     return list(reversed(items))
 
 
 @app.get("/live/alerts")
-def live_alerts(limit: int = 50):
+def live_alerts(limit: int = 50, user: str = Depends(current_user)):
     """Fast, rule-based tripwire alerts -- millisecond latency, NOT the ML
     world model. See app/live/tripwire.py. Complementary to /live/recent,
     which is the slower LSTM forecast that needs real window history."""
-    return tripwire.recent(limit=limit)
+    return tripwire.recent(user, limit=limit)
 
 
 @app.get("/live/packets/{remote_ip}")
-def live_packets(remote_ip: str, limit: int = 100):
+def live_packets(remote_ip: str, limit: int = 100, user: str = Depends(current_user)):
     """Raw, individual packets captured to/from one remote host, most
     recent first, each with a plain-English description of what it is
     (SYN/SYN-ACK/RST/FIN/data/ACK). Independent of the window-based
     aggregate features and of the initiation-direction filter those use --
     this shows everything actually captured for that IP."""
     _require_ready()
-    if live_capture.tracker is None:
+    if live_capture.tracker is None or live_capture.owner != user:
         raise HTTPException(status_code=404, detail="live capture is not running")
     return live_capture.tracker.recent_packets(remote_ip, limit=limit)

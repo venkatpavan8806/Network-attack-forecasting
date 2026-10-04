@@ -14,3 +14,11 @@ services:
       paths:
         - backend/**
         - render.yaml
+    envVars:
+      # Supabase -> Connect -> "Session pooler" connection string, with your
+      # database password in place of [YOUR-PASSWORD] (URL-encode @ as %40).
+      - key: DATABASE_URL
+        sync: false
+      # Supabase -> Project Settings -> Data API -> Project URL (https://xxxx.supabase.co)
+      - key: SUPABASE_URL
+        sync: false
