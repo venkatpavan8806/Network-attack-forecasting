@@ -72,3 +72,14 @@ def current_user(authorization: str | None = Header(default=None)) -> str:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="not signed in")
     return verify_token(authorization[7:].strip())
+
+
+def current_sensor(authorization: str | None = Header(default=None)) -> dict:
+    """FastAPI dependency for capture-agent endpoints: the sensor (with its
+    owner's user_id) identified by the agent's private token."""
+    from app import db
+    token = authorization[7:].strip() if authorization and authorization.lower().startswith("bearer ") else None
+    sensor = db.sensor_by_token(token) if token else None
+    if sensor is None:
+        raise HTTPException(status_code=401, detail="unknown or revoked agent token -- add a new sensor on the website")
+    return sensor

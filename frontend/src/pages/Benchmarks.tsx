@@ -41,7 +41,7 @@ export default function Benchmarks() {
   return (
     <div className="flex flex-col gap-6">
       <div className="card p-6">
-        <CardHeader title="Benchmark: World Model vs. Logistic Regression Baseline" subtitle={benchmark?.note ?? 'computed on a held-out, by-host test split'} />
+        <CardHeader title="Benchmark: World Model vs. Logistic Regression Baseline" subtitle={benchmark?.note ?? 'computed on your own uploaded, labelled traffic'} />
         {benchmark ? (
           <div className="h-80">
             <ResponsiveContainer width="100%" height="100%">
@@ -57,7 +57,7 @@ export default function Benchmarks() {
             </ResponsiveContainer>
           </div>
         ) : (
-          <div className="h-80 flex items-center justify-center text-sm text-[var(--color-ink-faint)]">not yet available — run `python -m app.train`</div>
+          <div className="h-80 flex items-center justify-center text-sm text-center px-6 text-[var(--color-ink-faint)]">No labelled traffic yet — upload a CSV with a true_stage column (Forecasts → CSV Ingestion) to see this computed on your data.</div>
         )}
         {benchmark && (
           <div className="grid grid-cols-2 gap-4 mt-4 text-xs text-[var(--color-ink-dim)]">
@@ -71,7 +71,7 @@ export default function Benchmarks() {
         <div className="card p-6">
           <CardHeader
             title={`Calibration @ horizon t+${calibration?.horizon_windows ?? '?'}`}
-            subtitle={calibration ? `Brier score ${calibration.brier_score.toFixed(4)} · ${calibration.n_points} held-out rollout points` : undefined}
+            subtitle={calibration ? `Brier score ${calibration.brier_score.toFixed(4)} · ${calibration.n_points} rollout points on your data` : undefined}
           />
           {calibData.length ? (
             <div className="h-72">
@@ -87,7 +87,7 @@ export default function Benchmarks() {
               </ResponsiveContainer>
             </div>
           ) : (
-            <div className="h-72 flex items-center justify-center text-sm text-[var(--color-ink-faint)]">not yet available</div>
+            <div className="h-72 flex items-center justify-center text-sm text-center px-6 text-[var(--color-ink-faint)]">No labelled traffic yet — upload a CSV with a true_stage column (Forecasts → CSV Ingestion) to see this computed on your data.</div>
           )}
           <p className="text-xs text-[var(--color-ink-faint)] mt-2">
             Points near the dashed diagonal mean predicted probability tracks observed attack frequency — evidence of real forecasting, not a relabeled classifier.
@@ -106,7 +106,7 @@ export default function Benchmarks() {
                   </div>
                 </div>
                 <div className="bg-[var(--color-accent-soft)] rounded-xl p-4">
-                  <div className="text-xs text-[var(--color-ink-dim)]">Median (held-out only)</div>
+                  <div className="text-xs text-[var(--color-ink-dim)]">Median (your uploaded hosts)</div>
                   <div className="text-2xl font-bold text-[var(--color-ink)]">
                     {leadTime.median_lead_time_minutes_heldout_only != null ? `${leadTime.median_lead_time_minutes_heldout_only.toFixed(2)} min` : 'n/a'}
                   </div>
@@ -138,7 +138,7 @@ export default function Benchmarks() {
               </table>
             </div>
           ) : (
-            <div className="h-40 flex items-center justify-center text-sm text-[var(--color-ink-faint)]">not yet available</div>
+            <div className="h-40 flex items-center justify-center text-sm text-center px-6 text-[var(--color-ink-faint)]">No labelled traffic yet — upload a CSV with a true_stage column (Forecasts → CSV Ingestion) to see this computed on your data.</div>
           )}
         </div>
       </div>

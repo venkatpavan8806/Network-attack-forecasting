@@ -36,7 +36,7 @@ export default function RobustnessReportCard() {
       />
       {notComputed && (
         <div className="text-sm text-[var(--color-ink-faint)] py-8 text-center">
-          not yet computed -- run <code className="font-mono">python -m app.evaluate_robustness</code> (takes a few minutes)
+          Measures the training process itself (several retrainings with different seeds), so it can't be computed from uploaded traffic and isn't run on this deployment.
         </div>
       )}
       {!notComputed && !report && (

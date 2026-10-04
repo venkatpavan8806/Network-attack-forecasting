@@ -313,6 +313,34 @@ export interface LiveStatus {
   packets_seen: number;
   hosts_seen: number;
   error: string | null;
+  mode?: 'agent' | 'local';
+  agent_online?: boolean;
+  agent_name?: string | null;
+  agent_hostname?: string | null;
+}
+
+// capture agent ("sensor") registered by the signed-in user
+export interface Sensor {
+  id: string;
+  name: string;
+  token_hint: string;
+  created_at: string;
+  last_seen_at: string | null;
+  online: boolean;
+  hostname: string | null;
+  os: string | null;
+  agent_version: string | null;
+  interfaces: LiveInterface[];
+  capture_requested: boolean;
+  capture_iface: string | null;
+  capture_local_ip: string | null;
+  capturing: boolean;
+  packets_seen: number;
+  error: string | null;
+}
+
+export interface CreatedSensor extends Sensor {
+  token: string; // shown once
 }
 
 export interface LivePacket {

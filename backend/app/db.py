@@ -7,17 +7,25 @@ every query filters on it, so each user only ever sees their own data:
                    user starts with none
   inference_log    every real inference call (KPIs, "Recent Forecast Log")
   tripwire_alerts  fast rule-based alerts from a live capture the user started
+  sensors          the user's capture agents (token stored as a hash), the
+                   interfaces they reported, and the Start/Stop request
+  live_entries     one row per captured live window with its prediction
+  live_packets     recent raw packet headers per remote host (capped)
 
 Backend: Supabase Postgres when DATABASE_URL is set (production), otherwise
 a local SQLite file (development / tests).
 """
 from __future__ import annotations
 
+import hashlib
 import os
+import secrets
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 from sqlalchemy import (
+    Boolean, update,
     JSON, BigInteger, Column, DateTime, Float, Index, Integer, MetaData, String, Table,
     UniqueConstraint, create_engine, delete, func, insert, select, text,
 )
@@ -72,6 +80,54 @@ tripwire_alerts = Table(
     Column("detail", _Json),
     Index("ix_ta_user", "user_id", "id"),
 )
+
+sensors = Table(
+    "sensors", metadata,
+    Column("id", String(32), primary_key=True),
+    Column("user_id", String(64), nullable=False),
+    Column("name", String(100), nullable=False),
+    Column("token_hash", String(64), nullable=False, unique=True),
+    Column("token_hint", String(12), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("last_seen_at", DateTime(timezone=True)),
+    Column("hostname", String(255)),
+    Column("os", String(100)),
+    Column("agent_version", String(32)),
+    Column("interfaces", _Json),                       # [{name, ip, description}] reported by the agent
+    Column("capture_requested", Boolean, nullable=False, server_default="0"),
+    Column("capture_iface", String(255)),
+    Column("capture_local_ip", String(64)),
+    Column("capture_started_at", DateTime(timezone=True)),
+    Column("capturing", Boolean, nullable=False, server_default="0"),  # agent-confirmed
+    Column("packets_seen", BigInteger, nullable=False, server_default="0"),
+    Column("error", String(500)),
+    Index("ix_sensors_user", "user_id"),
+)
+
+live_entries = Table(
+    "live_entries", metadata,
+    Column("id", _Id, primary_key=True, autoincrement=True),
+    Column("user_id", String(64), nullable=False),
+    Column("host_id", String(128), nullable=False),
+    Column("window_idx", Integer, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("entry", _Json, nullable=False),
+    Index("ix_le_user", "user_id", "id"),
+)
+
+live_packets = Table(
+    "live_packets", metadata,
+    Column("id", _Id, primary_key=True, autoincrement=True),
+    Column("user_id", String(64), nullable=False),
+    Column("remote_ip", String(64), nullable=False),
+    Column("packet", _Json, nullable=False),
+    Index("ix_lp_user_ip", "user_id", "remote_ip", "id"),
+)
+
+LIVE_ENTRIES_KEPT = 1000      # newest live windows kept per user
+PACKETS_KEPT_PER_HOST = 300   # newest packets kept per (user, remote host)
+SENSOR_ONLINE_SECONDS = 20    # an agent that polled within this many seconds is online
+TOKEN_PREFIX = "nadf_"
 
 # ---------------------------------------------------------------------------
 # engine
@@ -344,8 +400,129 @@ def recent_tripwire_alerts(user_id: str, limit: int = 50) -> list[dict]:
              "detail": r["detail"] or {}} for r in rows]
 
 
+def append_user_window(user_id: str, host_id: str, features: dict, true_stage=None, state_label=None) -> int:
+    """Appends one window to a host of this user (live capture) and returns its window_idx."""
+    uw = user_windows
+    with engine().begin() as conn:
+        last = conn.execute(select(func.max(uw.c.window_idx)).where(
+            uw.c.user_id == user_id, uw.c.host_id == host_id)).scalar()
+        idx = 0 if last is None else int(last) + 1
+        conn.execute(insert(uw).values(
+            user_id=user_id, host_id=host_id, window_idx=idx, true_stage=true_stage, state_label=state_label,
+            features={c: float(features[c]) for c in FEATURE_COLUMNS}))
+    return idx
+
+
+# ---------------------------------------------------------------------------
+# live capture results
+# ---------------------------------------------------------------------------
+def add_live_entry(user_id: str, entry: dict):
+    le = live_entries
+    with engine().begin() as conn:
+        conn.execute(insert(le).values(user_id=user_id, host_id=entry["host_id"], window_idx=int(entry["window_idx"]),
+                                       created_at=_now(), entry=entry))
+        cutoff = conn.execute(select(le.c.id).where(le.c.user_id == user_id).order_by(le.c.id.desc())
+                              .offset(LIVE_ENTRIES_KEPT - 1).limit(1)).scalar()
+        if cutoff is not None:
+            conn.execute(delete(le).where(le.c.user_id == user_id, le.c.id < cutoff))
+
+
+def recent_live_entries(user_id: str, limit: int = 50) -> list[dict]:
+    le = live_entries
+    with engine().connect() as conn:
+        rows = conn.execute(select(le.c.entry).where(le.c.user_id == user_id)
+                            .order_by(le.c.id.desc()).limit(limit)).all()
+    return [r[0] for r in rows]
+
+
+def add_live_packets(user_id: str, packets: list[dict]):
+    if not packets:
+        return
+    lp = live_packets
+    with engine().begin() as conn:
+        conn.execute(insert(lp), [{"user_id": user_id, "remote_ip": str(p["remote_ip"])[:64], "packet": p}
+                                  for p in packets])
+        for ip in {str(p["remote_ip"])[:64] for p in packets}:
+            cutoff = conn.execute(select(lp.c.id).where(lp.c.user_id == user_id, lp.c.remote_ip == ip)
+                                  .order_by(lp.c.id.desc()).offset(PACKETS_KEPT_PER_HOST - 1).limit(1)).scalar()
+            if cutoff is not None:
+                conn.execute(delete(lp).where(lp.c.user_id == user_id, lp.c.remote_ip == ip, lp.c.id < cutoff))
+
+
+def recent_live_packets(user_id: str, remote_ip: str, limit: int = 100) -> list[dict]:
+    lp = live_packets
+    with engine().connect() as conn:
+        rows = conn.execute(select(lp.c.packet).where(lp.c.user_id == user_id, lp.c.remote_ip == remote_ip)
+                            .order_by(lp.c.id.desc()).limit(limit)).all()
+    return [r[0] for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# sensors (capture agents)
+# ---------------------------------------------------------------------------
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _sensor_dict(r) -> dict:
+    last = _aware(r["last_seen_at"])
+    online = bool(last and (_now() - last).total_seconds() <= SENSOR_ONLINE_SECONDS)
+    return {"id": r["id"], "name": r["name"], "token_hint": r["token_hint"], "created_at": _iso(r["created_at"]),
+            "last_seen_at": _iso(last), "online": online, "hostname": r["hostname"], "os": r["os"],
+            "agent_version": r["agent_version"], "interfaces": r["interfaces"] or [],
+            "capture_requested": bool(r["capture_requested"]), "capture_iface": r["capture_iface"],
+            "capture_local_ip": r["capture_local_ip"], "capture_started_at": _iso(r["capture_started_at"]),
+            "capturing": bool(r["capturing"]) and online, "packets_seen": int(r["packets_seen"] or 0),
+            "error": r["error"]}
+
+
+def create_sensor(user_id: str, name: str) -> tuple[dict, str]:
+    """Returns (sensor, token). The token is shown once; only its hash is stored."""
+    token = TOKEN_PREFIX + secrets.token_urlsafe(32)
+    sid = uuid.uuid4().hex
+    with engine().begin() as conn:
+        conn.execute(insert(sensors).values(id=sid, user_id=user_id, name=(name or "my-laptop")[:100],
+                                            token_hash=_hash_token(token), token_hint=token[-6:],
+                                            created_at=_now()))
+        row = conn.execute(select(sensors).where(sensors.c.id == sid)).mappings().first()
+    return _sensor_dict(row), token
+
+
+def list_sensors(user_id: str) -> list[dict]:
+    with engine().connect() as conn:
+        rows = conn.execute(select(sensors).where(sensors.c.user_id == user_id)
+                            .order_by(sensors.c.created_at)).mappings().all()
+    return [_sensor_dict(r) for r in rows]
+
+
+def delete_sensor(user_id: str, sensor_id: str) -> bool:
+    with engine().begin() as conn:
+        res = conn.execute(delete(sensors).where(sensors.c.user_id == user_id, sensors.c.id == sensor_id))
+    return res.rowcount > 0
+
+
+def sensor_by_token(token: str) -> dict | None:
+    if not token or not token.startswith(TOKEN_PREFIX):
+        return None
+    with engine().connect() as conn:
+        row = conn.execute(select(sensors).where(sensors.c.token_hash == _hash_token(token))).mappings().first()
+    return None if row is None else {**_sensor_dict(row), "user_id": row["user_id"]}
+
+
+def update_sensor(sensor_id: str, touch: bool = True, **fields):
+    """Updates reported/requested fields; touch=True also marks the agent as seen now."""
+    allowed = {"hostname", "os", "agent_version", "interfaces", "capture_requested", "capture_iface",
+               "capture_local_ip", "capture_started_at", "capturing", "packets_seen", "error"}
+    values = {k: v for k, v in fields.items() if k in allowed}
+    if touch:
+        values["last_seen_at"] = _now()
+    if values:
+        with engine().begin() as conn:
+            conn.execute(update(sensors).where(sensors.c.id == sensor_id).values(**values))
+
+
 def delete_user(user_id: str):
     """Removes everything stored for one user (used by tests)."""
     with engine().begin() as conn:
-        for t in (user_windows, inference_log, tripwire_alerts):
+        for t in (user_windows, inference_log, tripwire_alerts, sensors, live_entries, live_packets):
             conn.execute(delete(t).where(t.c.user_id == user_id))

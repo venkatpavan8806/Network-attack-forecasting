@@ -33,7 +33,6 @@ from collections import deque, defaultdict
 
 from app.config import WATCHED_PORTS
 from app.live.flow_tracker import PORT_SERVICE_NAMES
-from app import db
 
 MULTI_PORT_WINDOW_SECONDS = 3.0
 MULTI_PORT_THRESHOLD = 4
@@ -57,6 +56,7 @@ class Tripwire:
     def _raise(self, remote_ip: str, message: str, severity: str, detail: dict) -> dict:
         if self.owner is None:
             return {"remote_ip": remote_ip, "message": message, "severity": severity, "detail": detail}
+        from app import db  # lazy: this module also runs inside the capture agent, which has no database
         return db.log_tripwire_alert(self.owner, remote_ip, message, severity, detail)
 
     def on_inbound_syn(self, remote_ip: str, local_port: int, ts: float) -> list[dict]:
@@ -97,6 +97,7 @@ class Tripwire:
         return fired
 
     def recent(self, user_id: str, limit: int = 50) -> list[dict]:
+        from app import db
         return db.recent_tripwire_alerts(user_id, limit=limit)
 
 

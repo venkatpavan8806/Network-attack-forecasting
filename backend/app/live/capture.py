@@ -21,17 +21,10 @@ from collections import deque
 from datetime import datetime, timezone
 
 import numpy as np
-import torch
-import torch.nn.functional as F
 
-from app.config import FEATURE_COLUMNS, SEQ_LEN, ROLLOUT_K, WINDOW_SECONDS
+from app.config import FEATURE_COLUMNS, SEQ_LEN, WINDOW_SECONDS
 from app.live.flow_tracker import FlowTracker
 from app.live.tripwire import tripwire
-from app.models.lstm_world_model import infiltration_probability
-from app.models.attack_mapping import map_stage
-from app.explain.attention import explain_prediction
-from app import db
-from app.tracking.step_tracker import padded_window
 
 FULL_HISTORY_MAX = 1000  # windows kept per remote IP for step-by-step tracking
 
@@ -155,55 +148,16 @@ class LiveCaptureManager:
             return
 
         feats_by_remote = self.tracker.roll_window()
+        if self.owner is None:
+            return
         for remote_ip, feats in feats_by_remote.items():
-            row = np.array([feats[c] for c in FEATURE_COLUMNS], dtype=np.float32)
-            hist = self.history.setdefault(remote_ip, deque(maxlen=SEQ_LEN))
-            hist.append(row)
-            self.full_history.setdefault(remote_ip, deque(maxlen=FULL_HISTORY_MAX)).append(row)
-            self.window_counter[remote_ip] = self.window_counter.get(remote_ip, 0) + 1
-            window_idx = self.window_counter[remote_ip]
-            host_id = f"live:{remote_ip}"
-
-            entry = {
-                "host_id": host_id,
-                "window_idx": window_idx,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "raw_features": feats,
-                "predicted_stage": None,
-                "infiltration_probability_world_model": None,
-                "infiltration_probability_baseline": None,
-            }
-
-            # Predict after EVERY window, including the first SEQ_LEN-1:
-            # while fewer than SEQ_LEN windows exist, the input is
-            # left-padded with the earliest window (warm-up) -- see
-            # app/tracking/step_tracker.py:padded_window.
-            if len(hist) >= 1:
-                window_raw = np.stack(list(hist))
-                window_scaled = service.scaler.transform(window_raw).astype(np.float32)
-                window_scaled, n_real = padded_window(window_scaled, len(window_scaled) - 1)
-                entry["history_windows_used"] = n_real
-                entry["warmup"] = n_real < SEQ_LEN
-                explanation = explain_prediction(service.model, window_scaled)
-                baseline_prob = float(service.baseline.predict_proba(window_scaled[-1:])[0, 1])
-                predicted_stage = max(explanation["stage_probabilities"].items(), key=lambda kv: kv[1])[0]
-
-                entry["predicted_stage"] = predicted_stage
-                entry["attack_mapping"] = map_stage(predicted_stage)
-                entry["infiltration_probability_world_model"] = explanation["infiltration_probability"]
-                entry["infiltration_probability_baseline"] = round(baseline_prob, 4)
-                entry["stage_probabilities"] = explanation["stage_probabilities"]
-                entry["explanation"] = {
-                    "attention_over_past_windows": explanation["attention_over_past_windows"],
-                    "top_contributors": explanation["top_contributors"],
-                }
-
-                if self.owner is not None:
-                    db.log_inference(self.owner, host_id, window_idx, "world_model_lstm", predicted_stage,
-                                     explanation["infiltration_probability"], None, None, source="live_capture")
-                    db.log_inference(self.owner, host_id, window_idx, "baseline_logreg", None,
-                                     baseline_prob, None, None, source="live_capture")
-
+            # same path as the downloadable capture agent: saved to the owner's
+            # hosts as live:<ip> (so it appears on Forecasts) and predicted
+            # immediately, from the first window
+            entry = service.ingest_live_window(self.owner, remote_ip, feats)
+            self.window_counter[remote_ip] = entry["window_idx"] + 1
+            self.history.setdefault(remote_ip, deque(maxlen=SEQ_LEN)).append(
+                np.array([feats[c] for c in FEATURE_COLUMNS], dtype=np.float32))
             self.recent_predictions.append(entry)
 
 

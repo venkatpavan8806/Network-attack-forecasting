@@ -82,6 +82,7 @@ def client(real_service, tmp_path, monkeypatch):
     db.configure(f"sqlite:///{(tmp_path / 'test_api_state.sqlite3').as_posix()}")
     db.init_db()
     real_service._user_cache.clear()
+    real_service._report_cache.clear()
     c = TestClient(main_module.app)
     # the (dev-mode) user uploads their traffic, exactly like the website's CSV upload
     csv = real_service.labeled_df.to_csv(index=False).encode()
@@ -193,17 +194,42 @@ def test_stage_classes_route(client):
     assert "benign" in r.json()
 
 
-def test_threshold_calibration_route_404s_honestly_when_not_yet_computed(client, monkeypatch, tmp_path):
-    """The fixture's fast/tiny service never runs app.evaluate_... calibration
-    (that's train.py's job) -- the route must say so clearly, not crash.
-    Points THRESHOLD_CALIBRATION_JSON at a path that's guaranteed not to
-    exist, regardless of whether a real `python -m app.train` has been run
-    against this checkout's actual data/ directory."""
-    import app.inference.service as service_module
-    monkeypatch.setattr(service_module, "THRESHOLD_CALIBRATION_JSON", tmp_path / "no_such_file.json")
-    r = client.get("/threshold-calibration")
-    assert r.status_code == 404
-    assert "not yet computed" in r.json()["detail"]
+def test_benchmarks_are_computed_from_the_users_own_labelled_uploads(client):
+    """The fixture user uploaded labelled traffic: every Benchmarks report is
+    computed from it (not from the training run)."""
+    for path in ("/benchmark", "/calibration", "/lead-time", "/threshold-calibration", "/step-tracking-report"):
+        r = client.get(path)
+        assert r.status_code == 200, (path, r.text)
+    bench = client.get("/benchmark").json()
+    assert "your own uploaded" in bench["note"]
+    assert bench["world_model_lstm"]["n_samples"] > 0
+    lead = client.get("/lead-time").json()
+    assert {h["split"] for h in lead["per_host"]} == {"uploaded"}
+
+
+def test_benchmarks_are_blank_for_a_user_without_labelled_data(client, monkeypatch):
+    import jwt
+    from datetime import datetime, timedelta, timezone
+    from app import auth
+    monkeypatch.setattr(auth, "DEV_MODE", False)
+    monkeypatch.setattr(auth, "SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setattr(auth, "JWT_SECRET", "test-secret-test-secret-test-secret")
+    token = jwt.encode({"sub": "someone-else", "aud": "authenticated",
+                        "exp": datetime.now(timezone.utc) + timedelta(minutes=5)},
+                       "test-secret-test-secret-test-secret", algorithm="HS256")
+    for path in ("/benchmark", "/calibration", "/lead-time", "/threshold-calibration", "/step-tracking-report"):
+        r = client.get(path, headers={"Authorization": f"Bearer {token}"})
+        assert r.status_code == 404 and "No labelled traffic yet" in r.json()["detail"]
+
+
+def test_upload_with_only_true_stage_gets_state_labels_derived(real_service, tmp_path):
+    db.configure(f"sqlite:///{(tmp_path / 'derive.sqlite3').as_posix()}")
+    db.init_db()
+    real_service._user_cache.clear()
+    real_service._report_cache.clear()
+    host = real_service.labeled_df[real_service.labeled_df["host_id"] == "attack-host-000"]
+    real_service.ingest_csv("carol", host.drop(columns=["state_label"]))
+    assert real_service.user_df("carol")["state_label"].notna().all()
 
 
 def test_new_user_starts_blank_and_sees_only_what_they_upload(real_service, tmp_path):
