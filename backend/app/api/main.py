@@ -83,7 +83,6 @@ def kpis(user: str = Depends(current_user)):
 @app.get("/highest-risk-host")
 def highest_risk_host(user: str = Depends(current_user)):
     _require_ready()
-    service.ensure_user_data(user)
     row = db.highest_risk_host(user)
     if row is None:
         return None
@@ -292,14 +291,12 @@ async def ingest(file: UploadFile = File(...), user: str = Depends(current_user)
 @app.get("/attack-stage-breakdown")
 def attack_stage_breakdown(user: str = Depends(current_user)):
     _require_ready()
-    service.ensure_user_data(user)
     return db.stage_breakdown(user)
 
 
 @app.get("/forecast-log")
 def forecast_log(limit: int = 25, user: str = Depends(current_user)):
     _require_ready()
-    service.ensure_user_data(user)
     return db.recent_forecast_log(user, limit=limit)
 
 

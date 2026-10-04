@@ -3,9 +3,8 @@
 Every row belongs to one user (`user_id` = the Supabase Auth user id) and
 every query filters on it, so each user only ever sees their own data:
 
-  user_windows     the user's own traffic dataset -- a fresh, randomly
-                   generated set of hosts created the first time they sign
-                   in (see InferenceService.ensure_user_data)
+  user_windows     the hosts the user uploaded (telemetry CSV); a new
+                   user starts with none
   inference_log    every real inference call (KPIs, "Recent Forecast Log")
   tripwire_alerts  fast rule-based alerts from a live capture the user started
 
@@ -169,6 +168,16 @@ def user_has_data(user_id: str) -> bool:
         return conn.execute(
             select(user_windows.c.id).where(user_windows.c.user_id == user_id).limit(1)
         ).first() is not None
+
+
+def replace_user_hosts(user_id: str, df: pd.DataFrame):
+    """Saves the hosts in df for this user, replacing any earlier upload of
+    the same host ids."""
+    host_ids = sorted(df["host_id"].astype(str).unique())
+    with engine().begin() as conn:
+        conn.execute(delete(user_windows).where(user_windows.c.user_id == user_id,
+                                                user_windows.c.host_id.in_(host_ids)))
+    insert_user_windows(user_id, df)
 
 
 def insert_user_windows(user_id: str, df: pd.DataFrame):

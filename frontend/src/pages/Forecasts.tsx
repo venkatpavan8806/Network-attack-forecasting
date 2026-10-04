@@ -71,6 +71,7 @@ export default function Forecasts({ selectedHost, onSelectHost }: { selectedHost
       } else {
         const res = await api.ingest(file);
         setUploadResult({ outcome: 'success', errors: [], rows: res.length, hosts: new Set(res.map((r) => r.host_id)).size });
+        setHosts(await api.hosts()); // uploaded hosts are saved to this user's account
         if (res.length) onSelectHost(res[0].host_id);
       }
     } catch (e: any) {

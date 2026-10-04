@@ -82,7 +82,11 @@ def client(real_service, tmp_path, monkeypatch):
     db.configure(f"sqlite:///{(tmp_path / 'test_api_state.sqlite3').as_posix()}")
     db.init_db()
     real_service._user_cache.clear()
-    return TestClient(main_module.app)
+    c = TestClient(main_module.app)
+    # the (dev-mode) user uploads their traffic, exactly like the website's CSV upload
+    csv = real_service.labeled_df.to_csv(index=False).encode()
+    assert c.post("/ingest", files={"file": ("telemetry.csv", csv, "text/csv")}).status_code == 200
+    return c
 
 
 def _demo_host_id(real_service) -> str:
@@ -202,18 +206,29 @@ def test_threshold_calibration_route_404s_honestly_when_not_yet_computed(client,
     assert "not yet computed" in r.json()["detail"]
 
 
-def test_each_user_gets_their_own_fresh_dataset(real_service, tmp_path):
-    """Two accounts get different, independently generated traffic."""
+def test_new_user_starts_blank_and_sees_only_what_they_upload(real_service, tmp_path):
+    """No pre-loaded or generated data: a new account is empty, and an
+    upload appears only in the uploader's own account."""
     db.configure(f"sqlite:///{(tmp_path / 'users.sqlite3').as_posix()}")
     db.init_db()
     real_service._user_cache.clear()
-    a = real_service.user_df("alice")
-    b = real_service.user_df("bob")
-    assert len(a) > 0 and len(b) > 0
-    assert not a[FEATURE_COLUMNS].head(50).equals(b[FEATURE_COLUMNS].head(50))
-    assert real_service.user_df("alice").equals(a)  # same user -> same data on later requests
-    assert len(db.recent_forecast_log("alice", limit=500)) > 0  # starts with their own forecasts
-    assert all(r["host_id"] in set(a["host_id"]) for r in db.recent_forecast_log("alice", limit=500))
+    assert real_service.list_demo_hosts("alice") == []
+    assert db.recent_forecast_log("alice") == []
+    assert db.highest_risk_host("alice") is None
+
+    one_host = real_service.labeled_df[real_service.labeled_df["host_id"] == "attack-host-000"]
+    real_service.ingest_csv("alice", one_host)
+    assert real_service.list_demo_hosts("alice") == ["attack-host-000"]
+    assert real_service.list_demo_hosts("bob") == []
+    assert db.recent_forecast_log("bob") == []
+    assert len(db.recent_forecast_log("alice")) > 0
+
+    # re-uploading the same host replaces it instead of duplicating windows
+    real_service.ingest_csv("alice", one_host)
+    assert len(real_service.user_df("alice")) == len(one_host)
+    # and it is still there after the in-memory cache is gone (e.g. a server restart)
+    real_service._user_cache.clear()
+    assert len(real_service.user_df("alice")) == len(one_host)
 
 
 def test_backend_rejects_requests_without_a_login(client, monkeypatch):
@@ -235,4 +250,4 @@ def test_backend_accepts_a_valid_supabase_token(client, monkeypatch):
                         "exp": datetime.now(timezone.utc) + timedelta(minutes=5)},
                        "test-secret-test-secret-test-secret", algorithm="HS256")
     r = client.get("/hosts", headers={"Authorization": f"Bearer {token}"})
-    assert r.status_code == 200 and len(r.json()) > 0
+    assert r.status_code == 200 and r.json() == []  # signed in, new account: blank

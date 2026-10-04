@@ -5,8 +5,6 @@ no fixed/dummy outputs regardless of input, per the project's anti-stub rule.
 from __future__ import annotations
 
 import json
-import secrets
-import threading
 from collections import OrderedDict
 
 import numpy as np
@@ -38,13 +36,7 @@ from app.models.ngram_move_model import NGramMoveModel, NGRAM_MODEL_JSON, labels
 from app.tracking.step_tracker import track_host
 
 SHAP_BACKGROUND_SIZE = 200  # normal-traffic windows used as SHAP's reference point
-
-# Each new user gets their own freshly generated dataset of this size (a new
-# random seed per user -- different hosts' traffic for every account).
-USER_BENIGN_HOSTS = 6
-USER_ATTACK_HOSTS = 6
-USER_BENIGN_LEN = 120
-USER_CACHE_SIZE = 32  # users whose dataset is kept in memory
+USER_CACHE_SIZE = 32  # users whose data is kept in memory
 
 
 class ArtifactsNotReadyError(RuntimeError):
@@ -84,8 +76,6 @@ class InferenceService:
         self.shap_explainer: BaselineShapExplainer | None = None
         self.ngram: NGramMoveModel | None = None
         self._user_cache: OrderedDict[str, pd.DataFrame] = OrderedDict()
-        self._locks: dict[str, threading.Lock] = {}
-        self._locks_guard = threading.Lock()
         self.ready = False
 
     def load(self):
@@ -145,46 +135,7 @@ class InferenceService:
         seqs = [s for s in seqs if s]
         return NGramMoveModel(order=3).fit(seqs) if seqs else None
 
-    # -- each user's own dataset -------------------------------------------
-    def ensure_user_data(self, user_id: str):
-        """First request from a new user: generate THEIR OWN dataset (a new
-        random seed, so every account gets different traffic), store it, and
-        run the world model on each host so their dashboard starts with
-        their own forecasts. Later requests reuse it."""
-        if user_id in self._user_cache:
-            return
-        with self._user_lock(user_id):
-            if user_id in self._user_cache or db.user_has_data(user_id):
-                return
-            from app.data_gen.generator import generate_dataset
-            raw = generate_dataset(seed=secrets.randbits(32), n_benign_hosts=USER_BENIGN_HOSTS,
-                                   n_attack_hosts=USER_ATTACK_HOSTS, benign_len=USER_BENIGN_LEN)
-            labeled = derive_state_labels(raw)
-            db.insert_user_windows(user_id, labeled)
-            self._remember(user_id, labeled)
-            for host_id, host_df in labeled.groupby("host_id", sort=True):
-                host_df = host_df.sort_values("window_idx")
-                end = self._first_attack_segment_end(host_df)
-                upto = host_df[host_df["window_idx"] <= end] if end is not None else host_df
-                if len(upto) >= SEQ_LEN:
-                    self.forecast_host_from_dataframe(host_id, upto, log_source="live", user_id=user_id)
-
-    @staticmethod
-    def _first_attack_segment_end(host_df: pd.DataFrame):
-        """window_idx at the end of the host's first non-benign segment (None for benign hosts)."""
-        current, end = None, None
-        for stage, w in zip(host_df["true_stage"], host_df["window_idx"]):
-            if stage != current:
-                if current not in (None, "benign"):
-                    return end
-                current = stage
-            end = w
-        return end if current not in (None, "benign") else None
-
-    def _user_lock(self, user_id: str) -> threading.Lock:
-        with self._locks_guard:
-            return self._locks.setdefault(user_id, threading.Lock())
-
+    # -- each user's own data: only what they uploaded ---------------------
     def _remember(self, user_id: str, df: pd.DataFrame):
         self._user_cache[user_id] = df
         self._user_cache.move_to_end(user_id)
@@ -192,8 +143,7 @@ class InferenceService:
             self._user_cache.popitem(last=False)
 
     def user_df(self, user_id: str) -> pd.DataFrame:
-        """The user's own dataset (generated on first use)."""
-        self.ensure_user_data(user_id)
+        """The user's own data: every host they uploaded (empty for a new user)."""
         df = self._user_cache.get(user_id)
         if df is None:
             df = db.user_frame(user_id)
@@ -414,11 +364,21 @@ class InferenceService:
         }
 
     def ingest_csv(self, user_id: str, df: pd.DataFrame):
-        """Parses an uploaded CSV of synthetic-telemetry-shaped rows and runs
-        real inference for the LAST window of every host present in it."""
+        """Parses an uploaded telemetry CSV, saves every host in it to the
+        user's own data (re-uploading a host replaces it), so it appears in
+        their host list and on every page, and runs real inference for the
+        LAST window of every host present in it."""
         errors = self.validate_telemetry_csv(df)
         if errors:
             raise ValueError("; ".join(errors))
+        stored = df.copy()
+        stored["host_id"] = stored["host_id"].astype(str)
+        for col in ("true_stage", "state_label"):
+            if col not in stored.columns:
+                stored[col] = None
+            stored[col] = stored[col].where(stored[col].notna(), None)
+        db.replace_user_hosts(user_id, stored[["host_id", "window_idx", "true_stage", "state_label"] + FEATURE_COLUMNS])
+        self._user_cache.pop(user_id, None)
         results = []
         for host_id, host_df in df.groupby("host_id"):
             results.append(self.forecast_host_from_dataframe(str(host_id), host_df, log_source="ingest",
