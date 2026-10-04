@@ -159,6 +159,33 @@ def default_url() -> str:
     return os.environ.get("DATABASE_URL") or f"sqlite:///{(DATA_DIR / 'app_state.sqlite3').as_posix()}"
 
 
+def describe_url(url: str | None = None) -> str:
+    """Human-readable database target WITHOUT the password, plus hints for
+    the usual Supabase connection-string mistakes."""
+    from sqlalchemy.engine import make_url
+    raw = url or default_url()
+    if "[YOUR-PASSWORD]" in raw or "[" in raw.split("@")[0]:
+        return "DATABASE_URL still contains the [YOUR-PASSWORD] placeholder -- put the real database password in"
+    try:
+        u = make_url(_normalise_url(raw))
+    except Exception as e:
+        return f"DATABASE_URL is not a valid URL ({e}) -- if the password has @ # / : ? % characters, URL-encode them"
+    if u.drivername.startswith("sqlite"):
+        return f"sqlite database {u.database}"
+    desc = f"postgres host={u.host} port={u.port} database={u.database} user={u.username}"
+    host = u.host or ""
+    if any(c in host for c in "@#/?%: "):
+        desc += (" -- the host looks broken: your password probably contains @ # / : ? % characters; "
+                 "URL-encode them (@ -> %40, # -> %23, / -> %2F) or choose a password with only letters and digits")
+    elif host.startswith("db.") and host.endswith(".supabase.co"):
+        desc += (" -- this is Supabase's IPv6-only DIRECT host; use the 'Session pooler' string "
+                 "(host aws-N-<region>.pooler.supabase.com) instead")
+    elif "pooler.supabase.com" not in host and ".supabase." not in host:
+        desc += (" -- unexpected host: if your password contains @ # / : ? %, URL-encode it "
+                 "(@ -> %40, # -> %23, / -> %2F) or choose a password with only letters and digits")
+    return desc
+
+
 def configure(url: str | None = None) -> Engine:
     """(Re)creates the engine. Called once at startup, and by tests to point
     at a throwaway database."""

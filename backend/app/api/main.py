@@ -48,14 +48,28 @@ app.add_middleware(
 )
 
 
+STARTUP_PROBLEM: str | None = None
+
+
 @app.on_event("startup")
 def startup():
-    db.configure()
+    """Never crashes the process: a bad DATABASE_URL or missing model files is
+    reported on /health (and in the logs) so it can be fixed from the
+    dashboard, instead of the service exiting in a restart loop."""
+    global STARTUP_PROBLEM
+    STARTUP_PROBLEM = None
+    target = db.describe_url()
+    print(f"[startup] database: {target}")
     try:
+        db.configure()
         service.load()
     except ArtifactsNotReadyError as e:
-        # Server still starts so /health reports the real reason instead of crashing silently.
+        STARTUP_PROBLEM = str(e)
         print(f"[startup] {e}")
+    except Exception as e:  # database unreachable / bad credentials / bad URL
+        msg = str(e).splitlines()[0][:300] if str(e) else type(e).__name__
+        STARTUP_PROBLEM = f"database connection failed: {msg} [{target}]"
+        print(f"[startup] {STARTUP_PROBLEM}")
     if auth.CONFIG.problem:
         print(f"[startup] AUTH PROBLEM: {auth.CONFIG.problem}")
 
@@ -64,7 +78,7 @@ def _require_ready():
     if not service.ready:
         raise HTTPException(
             status_code=503,
-            detail="Model artifacts not trained yet. Run `python -m app.train` in the backend directory, then restart the API.",
+            detail=STARTUP_PROBLEM or "Model artifacts not trained yet. Run `python -m app.train` in the backend directory, then restart the API.",
         )
 
 
@@ -91,7 +105,7 @@ def health():
         "ready": service.ready,
         "auth_mode": auth.CONFIG.mode,
         "database": db.engine().dialect.name,
-        "problem": auth.CONFIG.problem,
+        "problem": STARTUP_PROBLEM or auth.CONFIG.problem,
     }
 
 

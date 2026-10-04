@@ -244,3 +244,25 @@ def test_csv_ingest_stores_windows_for_the_caller(client, real_service):
     r = client.post("/ingest", files={"file": ("t.csv", csv, "text/csv")}, headers=ALICE)
     assert r.status_code == 200
     assert len(client.get(f"/host-timeline/{host}", headers=ALICE).json()) == len(df)
+
+
+def test_unreachable_database_is_reported_on_health_instead_of_crashing(monkeypatch, real_service):
+    """A wrong DATABASE_URL (e.g. Supabase's IPv6-only direct host) must not
+    crash the server into a restart loop: /health explains what to fix."""
+    import app.api.main as main_module
+    from fastapi.testclient import TestClient
+    from app import db
+
+    bad = "postgresql://postgres:pw@db.nonexistent-project.supabase.co:5432/postgres"
+    monkeypatch.setenv("DATABASE_URL", bad)
+    monkeypatch.setattr(main_module, "service", real_service)
+    monkeypatch.setattr(real_service, "ready", False)
+    monkeypatch.setattr(real_service, "load", lambda: (db.init_db(), None)[1])
+    with TestClient(main_module.app) as c:  # runs the startup hook
+        body = c.get("/health").json()
+        assert body["status"] == "not_ready"
+        assert "database connection failed" in body["problem"]
+        assert "Session pooler" in body["problem"]
+        assert "pw@" not in body["problem"]  # password never echoed
+        assert c.get("/hosts", headers=ALICE).status_code == 503
+    db.configure("sqlite://")
