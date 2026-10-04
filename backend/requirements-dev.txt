@@ -1,0 +1,5 @@
+# Extra dependencies for running the test suite locally.
+-r requirements.txt
+pytest==8.3.3
+httpx==0.28.1
+shap==0.46.0

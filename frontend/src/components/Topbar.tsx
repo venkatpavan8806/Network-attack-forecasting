@@ -1,8 +1,10 @@
-import { BellIcon, LogIcon } from '../icons';
+import { LogIcon } from '../icons';
 import type { TabKey } from '../App';
+import { AUTH_MODE, useAuth } from '../auth';
 
 const tabs: { key: TabKey; label: string; disabled?: boolean }[] = [
   { key: 'overview', label: 'Overview' },
+  { key: 'capture', label: 'Capture' },
   { key: 'forecasts', label: 'Forecasts' },
   { key: 'explainability', label: 'Explainability' },
   { key: 'benchmarks', label: 'Benchmarks' },
@@ -17,24 +19,28 @@ function greeting() {
 }
 
 export default function Topbar({ active, onChange }: { active: TabKey; onChange: (t: TabKey) => void }) {
+  const { user, signOut } = useAuth();
+  const who = user?.email ?? (user?.isAnonymous ? 'Guest' : 'there');
+  const initial = (user?.email?.[0] ?? 'G').toUpperCase();
   return (
     <div className="flex flex-col gap-5">
       <div className="flex items-start justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-[var(--color-ink)]">{greeting()}, Team CARIBBEAN</h1>
+          <h1 className="text-2xl font-bold text-[var(--color-ink)]">{greeting()}, {who}</h1>
           <p className="text-sm text-[var(--color-ink-dim)] mt-1">
-            here's what your network looked like overnight
+            {AUTH_MODE === 'dev' ? 'local development mode -- this browser has its own private workspace' : 'your private network-attack forecasting workspace'}
           </p>
         </div>
         <div className="flex items-center gap-3">
-          <button className="w-10 h-10 rounded-full bg-white card flex items-center justify-center text-[var(--color-ink-dim)]">
-            <BellIcon size={17} />
+          <button
+            onClick={() => signOut()}
+            title={AUTH_MODE === 'dev' ? 'Start a fresh local workspace' : 'Sign out'}
+            className="h-10 px-4 rounded-full bg-white card flex items-center gap-2 justify-center text-sm text-[var(--color-ink-dim)]"
+          >
+            <LogIcon size={16} /> {AUTH_MODE === 'dev' ? 'New workspace' : 'Sign out'}
           </button>
-          <button className="w-10 h-10 rounded-full bg-white card flex items-center justify-center text-[var(--color-ink-dim)]">
-            <LogIcon size={17} />
-          </button>
-          <div className="w-10 h-10 rounded-full bg-[var(--color-accent)] flex items-center justify-center text-white font-semibold text-sm">
-            SIH
+          <div title={user?.email ?? 'guest'} className="w-10 h-10 rounded-full bg-[var(--color-accent)] flex items-center justify-center text-white font-semibold text-sm">
+            {initial}
           </div>
         </div>
       </div>

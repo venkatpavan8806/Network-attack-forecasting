@@ -51,40 +51,54 @@ backend/
       calibration.py           reliability diagram at a fixed rollout horizon
       lead_time.py             lead-time metric vs. the baseline
       false_alarms.py          real false-alarm examples from held-out benign hosts
-    inference/service.py      shared inference layer used by the API
+    inference/service.py      shared inference layer used by the API (per-user)
+    ingest/pcap.py            .pcap/.pcapng replay through the live feature + tripwire code
+    live/flow_tracker.py      packets -> 30 s window features (shared with the capture agent)
+    live/tripwire.py          fast rule-based alerts (shared with the capture agent)
     api/main.py                FastAPI app
-    db.py                      SQLite-backed inference log (KPIs, forecast log table)
+    auth.py                    Supabase login verification (JWKS / legacy secret) + sensor tokens
+    db.py                      per-user storage (SQLAlchemy: Supabase Postgres or local SQLite)
     train.py                   end-to-end training/evaluation entry point
-  tests/                      pytest suite (75 tests)
+  agent/                      downloadable capture agent (nadf_agent.py)
+  Dockerfile                  Render image (trains the models at build time)
+  tests/                      pytest suite
   data/                       generated CSVs + JSON reports (all produced by train.py)
   models_store/               saved LSTM weights + baseline + scaler
 frontend/
-  src/                        React + TypeScript + Recharts dashboard
+  src/                        React + TypeScript + Recharts dashboard (Supabase Auth login)
+  vercel.json                 Vercel config
+render.yaml                   Render Blueprint for the backend
+DEPLOY.md                     Supabase + Render + Vercel deployment guide
 ```
 
 ## Running it
 
-Backend (Python 3.12):
+**As a website (multi-user):** Supabase (login + Postgres), Render (backend
+API, Docker), Vercel (frontend). Step-by-step guide: [DEPLOY.md](DEPLOY.md).
+
+* Every account gets its own empty workspace; all traffic, forecasts, alerts
+  and sensors are stored per user and every query is scoped to the caller.
+* Data comes from the user: a **capture agent** they download from the
+  *Capture* tab and run on the machine to monitor (browsers cannot read
+  packets), a **pcap upload** (replayed through the same feature code), a
+  telemetry CSV, or freshly generated **sample traffic**.
+
+**Locally** (no cloud accounts; SQLite + dev auth, one workspace per browser):
 
 ```bash
 cd backend
 python -m venv venv
-venv\Scripts\pip install -r requirements.txt
-venv\Scripts\python -m app.train        # generates data, trains both models, computes all reports (~30s on CPU)
-venv\Scripts\python -m pytest -q        # 75 tests
+venv\Scripts\pip install -r requirements-dev.txt
+venv\Scripts\python -m app.train        # generates data, trains the models, computes all reports (~10 min on CPU)
+venv\Scripts\python -m pytest -q        # full test suite
 venv\Scripts\python -m uvicorn app.api.main:app --port 8000
 ```
-
-Frontend (Node 22):
 
 ```bash
 cd frontend
 npm install
 npm run dev        # proxies /api/* to http://127.0.0.1:8000, open the printed localhost URL
 ```
-
-Everything runs fully offline — no cloud API calls anywhere in the pipeline
-or the UI.
 
 ## Feature schema and anti-leakage rule
 
@@ -420,27 +434,25 @@ downloaded for this pass, per project scope.
 
 ## API
 
-FastAPI app (`app/api/main.py`), fully offline:
+FastAPI app (`app/api/main.py`). Endpoints marked *(user)* require a signed-in
+user (Supabase access token) and only ever see that user's data; *(agent)*
+endpoints take a sensor token; the rest describe the trained model and are public.
 
-- `GET /health`, `GET /kpis`, `GET /highest-risk-host`, `GET /hosts`
-- `GET /forecast/{host_id}` — real one-step forecast + K-step rollout +
-  explanation for a demo host
-- `GET /forecast/{host_id}/branches` — K-step forecast as a branching
-  MITRE-mapped attack-path tree (see "Branching K-step forecast" above)
-- `GET /track/{host_id}` — step-by-step attacker tracking: a next-step
-  prediction after every window from window 1, the attack path so far, and
-  the next 1/2/3 moves (demo hosts and `live:<ip>` hosts)
-- `GET /step-tracking-report` — tracking accuracy + next-1/2/3-move
-  comparison (Markov / trigram / LSTM / hybrid)
-- `POST /sandbox/test` — genuinely validates an uploaded CSV and returns
-  `outcome: "failure"` with specific reasons when the input actually is
-  malformed (missing columns, non-numeric values, too few windows per host)
-- `POST /ingest` — parses an uploaded CSV and runs real inference on it
-- `GET /attack-stage-breakdown`, `GET /forecast-log`, `GET /attack-mapping`
-- `GET /benchmark`, `GET /calibration`, `GET /lead-time`, `GET /false-alarms`
-  — serve the JSON reports produced by `app/train.py`
+- `GET /health` -- readiness, auth mode, database type
+- *(user)* `GET /me`, `GET /kpis`, `GET /highest-risk-host`, `GET /hosts`, `GET /hosts/details`, `DELETE /hosts/{host_id}`
+- *(user)* `GET /forecast/{host_id}` -- one-step forecast + K-step rollout + explanation (works from the first window; warm-up flagged)
+- *(user)* `GET /forecast/{host_id}/branches` -- branching MITRE-mapped attack-path tree
+- *(user)* `GET /track/{host_id}` -- a next-step prediction after every window, the attack path so far, the next 1/2/3 moves
+- *(user)* `GET /shap/{host_id}`, `GET /defense/{host_id}`, `GET /counterfactual/{host_id}`, `GET /digital-twin/state/{host_id}`, `POST /digital-twin/simulate`
+- *(user)* `POST /upload/pcap` -- replay a .pcap/.pcapng through the live feature + tripwire code
+- *(user)* `POST /sandbox/test` (validate only), `POST /ingest` -- telemetry CSV
+- *(user)* `POST /workspace/sample` -- fresh random synthetic traffic; `GET`/`DELETE /workspace`
+- *(user)* `GET/POST /sensors`, `DELETE /sensors/{id}` -- capture sensors (token shown once, stored hashed)
+- *(user)* `GET /live/status`, `/live/recent`, `/live/alerts`, `/live/packets/{host}` -- what the user's agents sent
+- `GET /agent/download` -- the capture agent zip (built from this server's own flow_tracker/tripwire code)
+- *(agent)* `POST /agent/hello`, `POST /agent/windows`, `POST /agent/alerts`
+- `GET /benchmark`, `/calibration`, `/lead-time`, `/false-alarms`, `/threshold-calibration`, `/robustness-report`, `/step-tracking-report`, `/attack-mapping`, `/stage-classes`, `/mitigations` -- model reports from `app/train.py`
 
-All KPIs and the "Recent Forecast Log" table are backed by a small SQLite
-log (`app/db.py`) seeded from the real training-run predictions and appended
-to by every live `/forecast` or `/ingest` call — nothing is a fixed
-placeholder.
+Storage (`app/db.py`): every window, prediction, log row, alert, packet and
+sensor carries the owner's user id; nothing is seeded or shared between
+accounts.

@@ -22,7 +22,7 @@ export default function DigitalTwin({ selectedHost, onSelectHost }: { selectedHo
 
   useEffect(() => {
     api.hosts().then((h) => {
-      const attackHosts = h.filter((x) => x.startsWith('attack-host'));
+      const attackHosts = h.filter((x) => x.includes('attack'));
       setHosts(attackHosts.length ? attackHosts : h);
       if (!selectedHost && (attackHosts.length || h.length)) onSelectHost((attackHosts[0] ?? h[0]));
     }).catch(() => {});
@@ -34,8 +34,10 @@ export default function DigitalTwin({ selectedHost, onSelectHost }: { selectedHo
     if (!selectedHost || isLive) return;
     api.hostTimeline(selectedHost).then((t) => {
       setTimeline(t);
-      const firstNonBenign = t.find((r) => r.true_stage !== 'benign');
-      setWindowIdx(firstNonBenign ? firstNonBenign.window_idx - 1 : t[Math.max(0, t.length - 1)]?.window_idx ?? null);
+      // labelled traffic (sample data / labelled CSV): start just before the attack begins;
+      // unlabelled traffic (pcap uploads): start from the latest window
+      const firstNonBenign = t.find((r) => r.true_stage != null && r.true_stage !== 'benign');
+      setWindowIdx(firstNonBenign ? Math.max(t[0].window_idx, firstNonBenign.window_idx - 1) : t[Math.max(0, t.length - 1)]?.window_idx ?? null);
     }).catch(() => {});
   }, [selectedHost, isLive]);
 
@@ -62,6 +64,7 @@ export default function DigitalTwin({ selectedHost, onSelectHost }: { selectedHo
   // group the timeline into contiguous action segments for the "jump to" picker
   const segments: { action: string; startWindow: number; endWindow: number }[] = [];
   for (const row of timeline) {
+    if (!row.true_stage) continue; // unlabelled (live / pcap) windows have no ground-truth segment
     const last = segments[segments.length - 1];
     if (last && last.action === row.true_stage) {
       last.endWindow = row.window_idx;

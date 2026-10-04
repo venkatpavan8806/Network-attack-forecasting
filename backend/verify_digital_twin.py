@@ -10,8 +10,23 @@ import json
 from pathlib import Path
 import numpy as np
 
+from app import db
 from app.inference.service import service
-from app.config import DATA_DIR
+from app.config import DATA_DIR, FEATURE_COLUMNS
+
+# The API is multi-user; this script works in its own throwaway workspace,
+# filled with the training dataset's hosts it needs.
+VERIFY_USER = "verify-digital-twin"
+
+
+def _load_verify_hosts(host_ids):
+    db.configure("sqlite://")  # in-memory
+    db.init_db()
+    for host_id in host_ids:
+        g = service.labeled_df[service.labeled_df["host_id"] == host_id].sort_values("window_idx")
+        rows = [{"features": {c: float(r[c]) for c in FEATURE_COLUMNS}, "true_stage": r["true_stage"],
+                 "state_label": r["state_label"]} for _, r in g.iterrows()]
+        service.ingest_windows(VERIFY_USER, host_id, rows, source="sample")
 
 
 def run_proofs():
@@ -21,6 +36,7 @@ def run_proofs():
 
     service.load()
     print("[+] Model artifacts and dataset successfully loaded.")
+    _load_verify_hosts(sorted(service.labeled_df["host_id"].unique()))
     print(f"[+] Total available mitigations: {len(service.available_mitigations())}")
 
     # Scenarios to prove
@@ -77,7 +93,7 @@ def run_proofs():
         print(f"Target: {tc['host_id']} at Window #{tc['window_idx']} | Mitigation: {tc['mitigation_id']}")
 
         res = service.run_counterfactual(
-            tc["host_id"], tc["mitigation_id"], at_window_idx=tc["window_idx"]
+            VERIFY_USER, tc["host_id"], tc["mitigation_id"], at_window_idx=tc["window_idx"]
         )
 
         unmit_p = res["without_mitigation"]["infiltration_probs"]
@@ -145,7 +161,7 @@ def verify_sandbox_digital_twin_requirements():
     print("  [1/10] PASS: Initial twin state exists with target host and topology.")
 
     # 2. Dynamic attack representation
-    res = service.run_counterfactual(host_id, "isolate_host", at_window_idx=29)
+    res = service.run_counterfactual(VERIFY_USER, host_id, "isolate_host", at_window_idx=29)
     assert res.get("true_stage") is not None, "Failed: attack stage not represented dynamically"
     print(f"  [2/10] PASS: Current attack event represented dynamically (stage: {res['true_stage']}).")
 

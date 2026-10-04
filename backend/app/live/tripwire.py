@@ -21,27 +21,40 @@ Two rules, both evaluated per inbound SYN:
      port-scan heuristic used by rule-based IDS tools (Snort/Suricata-style
      thresholding), independent of the ML model entirely.
 
-Every fired alert is persisted to the database (app/db.py:log_tripwire_alert)
--- NOT just kept in memory. Restarting live capture (Tripwire.reset()) clears
-the in-process rule state (cooldown timers, rolling port buffers) but never
-deletes alert history; this is a genuine event log, not per-session state.
+Every fired alert is handed to a `sink` callback. The capture agent's sink
+queues it for upload to the backend (which stores it per user in the
+database); the pcap replay's sink collects it for the same upload. Reset()
+clears the in-process rule state (cooldown timers, rolling port buffers)
+but never deletes stored alert history.
 """
 from __future__ import annotations
 
 import threading
 from collections import deque, defaultdict
+from datetime import datetime, timezone
+from typing import Callable
 
 from app.config import WATCHED_PORTS
 from app.live.flow_tracker import PORT_SERVICE_NAMES
-from app import db
 
 MULTI_PORT_WINDOW_SECONDS = 3.0
 MULTI_PORT_THRESHOLD = 4
 WATCHED_PORT_COOLDOWN_SECONDS = 5.0
 
 
+AlertSink = Callable[[str, str, str, dict, float], dict]
+
+
+def memory_sink(remote_ip: str, message: str, severity: str, detail: dict, ts: float) -> dict:
+    """Default sink: just builds the alert record (timestamp = packet time)."""
+    when = datetime.fromtimestamp(ts, tz=timezone.utc) if ts > 0 else datetime.now(timezone.utc)
+    return {"timestamp": when.isoformat(timespec="milliseconds"), "remote_ip": remote_ip,
+            "message": message, "severity": severity, "detail": detail}
+
+
 class Tripwire:
-    def __init__(self):
+    def __init__(self, sink: AlertSink | None = None):
+        self._sink = sink or memory_sink
         self._lock = threading.Lock()
         self._recent_syn_ports: dict[str, deque] = defaultdict(deque)
         self._last_watched_alert: dict[tuple[str, int], float] = {}
@@ -53,8 +66,8 @@ class Tripwire:
             self._recent_syn_ports.clear()
             self._last_watched_alert.clear()
 
-    def _raise(self, remote_ip: str, message: str, severity: str, detail: dict) -> dict:
-        return db.log_tripwire_alert(remote_ip, message, severity, detail)
+    def _raise(self, remote_ip: str, message: str, severity: str, detail: dict, ts: float) -> dict:
+        return self._sink(remote_ip, message, severity, detail, ts)
 
     def on_inbound_syn(self, remote_ip: str, local_port: int, ts: float) -> list[dict]:
         """Call synchronously from the packet-capture callback for every
@@ -72,6 +85,7 @@ class Tripwire:
                     remote_ip, f"Connection attempt to {service_name} (port {local_port}) from {remote_ip}",
                     severity="warning",
                     detail={"rule": "watched_port_contact", "port": local_port, "service": service_name},
+                    ts=ts,
                 ))
 
         with self._lock:
@@ -89,12 +103,7 @@ class Tripwire:
                 f"Rapid multi-port probing from {remote_ip}: {n_distinct} distinct ports in under {MULTI_PORT_WINDOW_SECONDS:.0f}s",
                 severity="critical",
                 detail={"rule": "rapid_multi_port", "distinct_ports": distinct_ports, "window_seconds": MULTI_PORT_WINDOW_SECONDS},
+                ts=ts,
             ))
 
         return fired
-
-    def recent(self, limit: int = 50) -> list[dict]:
-        return db.recent_tripwire_alerts(limit=limit)
-
-
-tripwire = Tripwire()

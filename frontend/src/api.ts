@@ -3,24 +3,64 @@ import type {
   Kpis, HighestRiskHost, ForecastResponse, ForecastLogRow, StageBreakdown,
   BenchmarkReport, CalibrationReport, LeadTimeReport, FalseAlarmExample,
   SandboxTestResult, AttackMapping, MitigationInfo, CounterfactualResponse,
-  HostTimelineEntry, LiveStatus, LiveWindowEntry, LiveInterface, TripwireAlert, LivePacket,
+  HostTimelineEntry, LiveStatus, LiveWindowEntry, TripwireAlert, LivePacket,
+  Sensor, CreatedSensor, PcapUploadResult, SampleDataResult, HostDetail, WorkspaceCounts, MeResponse,
   ShapResponse, DefenseAdvice, BranchingForecastResponse, TrackResponse, StepTrackingReport,
   ThresholdCalibrationReport, RobustnessReport,
 } from './types';
 
-const client = axios.create({ baseURL: '/api' });
+import { authHeaders } from './auth';
+
+// Production: VITE_API_URL = the Render backend URL. Local dev: '/api' is
+// proxied to http://127.0.0.1:8000 by vite.config.ts.
+export const API_BASE = ((import.meta.env.VITE_API_URL as string | undefined) || '/api').replace(/\/$/, '');
+
+const client = axios.create({ baseURL: API_BASE, timeout: 120000 });
+client.interceptors.request.use((config) => {
+  Object.entries(authHeaders()).forEach(([k, v]) => config.headers.set(k, v));
+  return config;
+});
+
+/** Absolute URL the agent zip is downloaded from (public, no secrets inside). */
+export function agentDownloadUrl(): string {
+  // local dev: download straight from the backend so the zip is pre-filled
+  // with the backend's own address, not the Vite dev server's
+  return `${agentServerUrl()}/agent/download`;
+}
+
+/** Backend URL the downloaded agent should talk to. */
+export function agentServerUrl(): string {
+  return API_BASE.startsWith('http') ? API_BASE : 'http://127.0.0.1:8000';
+}
 
 export const api = {
   health: () => client.get('/health').then((r) => r.data),
   kpis: () => client.get<Kpis>('/kpis').then((r) => r.data),
   highestRiskHost: () => client.get<HighestRiskHost | null>('/highest-risk-host').then((r) => r.data),
+  me: () => client.get<MeResponse>('/me').then((r) => r.data),
   hosts: () => client.get<string[]>('/hosts').then((r) => r.data),
+  hostsDetails: () => client.get<HostDetail[]>('/hosts/details').then((r) => r.data),
+  deleteHost: (hostId: string) => client.delete(`/hosts/${encodeURIComponent(hostId)}`).then((r) => r.data),
+  workspace: () => client.get<WorkspaceCounts>('/workspace').then((r) => r.data),
+  resetWorkspace: (includeSensors = false) =>
+    client.delete<WorkspaceCounts>('/workspace', { params: { include_sensors: includeSensors } }).then((r) => r.data),
+  generateSample: (attackHosts = 2, benignHosts = 2) =>
+    client.post<SampleDataResult>('/workspace/sample', { attack_hosts: attackHosts, benign_hosts: benignHosts }).then((r) => r.data),
+  uploadPcap: (file: File, localIp?: string) => {
+    const form = new FormData();
+    form.append('file', file);
+    if (localIp) form.append('local_ip', localIp);
+    return client.post<PcapUploadResult>('/upload/pcap', form, { timeout: 600000 }).then((r) => r.data);
+  },
+  sensors: () => client.get<Sensor[]>('/sensors').then((r) => r.data),
+  createSensor: (name: string) => client.post<CreatedSensor>('/sensors', { name }).then((r) => r.data),
+  deleteSensor: (id: string) => client.delete(`/sensors/${id}`).then((r) => r.data),
   liveForecastableHosts: () => client.get<string[]>('/live/forecastable-hosts').then((r) => r.data),
-  hostTimeline: (hostId: string) => client.get<HostTimelineEntry[]>(`/host-timeline/${hostId}`).then((r) => r.data),
+  hostTimeline: (hostId: string) => client.get<HostTimelineEntry[]>(`/host-timeline/${encodeURIComponent(hostId)}`).then((r) => r.data),
   forecast: (hostId: string, atWindowIdx?: number) =>
-    client.get<ForecastResponse>(`/forecast/${hostId}`, { params: atWindowIdx != null ? { at_window_idx: atWindowIdx } : {} }).then((r) => r.data),
+    client.get<ForecastResponse>(`/forecast/${encodeURIComponent(hostId)}`, { params: atWindowIdx != null ? { at_window_idx: atWindowIdx } : {} }).then((r) => r.data),
   branchingForecast: (hostId: string, atWindowIdx?: number, depth?: number, branchFactor?: number) =>
-    client.get<BranchingForecastResponse>(`/forecast/${hostId}/branches`, {
+    client.get<BranchingForecastResponse>(`/forecast/${encodeURIComponent(hostId)}/branches`, {
       params: {
         ...(atWindowIdx != null ? { at_window_idx: atWindowIdx } : {}),
         ...(depth != null ? { depth } : {}),
@@ -42,7 +82,7 @@ export const api = {
   stageClasses: () => client.get<string[]>('/stage-classes').then((r) => r.data),
   mitigations: () => client.get<MitigationInfo[]>('/mitigations').then((r) => r.data),
   counterfactual: (hostId: string, mitigationId: string, atWindowIdx?: number) =>
-    client.get<CounterfactualResponse>(`/counterfactual/${hostId}`, {
+    client.get<CounterfactualResponse>(`/counterfactual/${encodeURIComponent(hostId)}`, {
       params: { mitigation_id: mitigationId, ...(atWindowIdx != null ? { at_window_idx: atWindowIdx } : {}) },
     }).then((r) => r.data),
   shap: (hostId: string, atWindowIdx?: number) =>
@@ -57,17 +97,13 @@ export const api = {
   ingest: (file: File) => {
     const form = new FormData();
     form.append('file', file);
-    return client.post<ForecastResponse[]>('/ingest', form).then((r) => r.data);
+    return client.post<ForecastResponse[]>('/ingest', form, { timeout: 600000 }).then((r) => r.data);
   },
-  liveInterfaces: () => client.get<LiveInterface[]>('/live/interfaces').then((r) => r.data),
   liveStatus: () => client.get<LiveStatus>('/live/status').then((r) => r.data),
-  liveStart: (iface: string, localIp: string) =>
-    client.post<LiveStatus>('/live/start', { iface, local_ip: localIp }).then((r) => r.data),
-  liveStop: () => client.post<LiveStatus>('/live/stop').then((r) => r.data),
   liveRecent: (limit = 50) => client.get<LiveWindowEntry[]>('/live/recent', { params: { limit } }).then((r) => r.data),
   liveAlerts: (limit = 50) => client.get<TripwireAlert[]>('/live/alerts', { params: { limit } }).then((r) => r.data),
   livePackets: (remoteIp: string, limit = 100) =>
-    client.get<LivePacket[]>(`/live/packets/${remoteIp}`, { params: { limit } }).then((r) => r.data),
+    client.get<LivePacket[]>(`/live/packets/${encodeURIComponent(remoteIp)}`, { params: { limit } }).then((r) => r.data),
 };
 
 // Colors follow the attack-progression: recon (amber) -> credential access

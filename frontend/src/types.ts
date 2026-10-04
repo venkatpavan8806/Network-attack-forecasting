@@ -156,8 +156,9 @@ export interface SandboxTestResult {
 
 export interface HostTimelineEntry {
   window_idx: number;
-  true_stage: string;
-  state_label: string;
+  true_stage: string | null; // null for live / pcap traffic (no ground truth)
+  state_label: string | null;
+  observed_at?: string | null;
 }
 
 export interface BranchNode {
@@ -299,14 +300,10 @@ export interface CounterfactualResponse {
   path_prediction?: PathPrediction;
 }
 
-export interface LiveInterface {
-  name: string;
-  description: string;
-  ip: string;
-}
-
 export interface LiveStatus {
   running: boolean;
+  sensors_total: number;
+  sensors_online: number;
   iface: string | null;
   local_ip: string | null;
   started_at: string | null;
@@ -346,6 +343,74 @@ export interface LiveWindowEntry {
   infiltration_probability_world_model: number | null;
   infiltration_probability_baseline: number | null;
   stage_probabilities?: Record<string, number>;
+  warmup?: boolean;
+  history_windows_used?: number;
+}
+
+// ---- multi-user workspace ------------------------------------------------------
+export interface Sensor {
+  id: string;
+  name: string;
+  token_hint: string;
+  created_at: string;
+  last_seen_at: string | null;
+  online: boolean;
+  hostname: string | null;
+  local_ip: string | null;
+  iface: string | null;
+  os: string | null;
+  agent_version: string | null;
+  packets_seen: number;
+  error: string | null;
+}
+
+export interface CreatedSensor extends Sensor {
+  token: string; // shown once
+}
+
+export interface IngestHostSummary {
+  host_id: string;
+  windows_added: number;
+  first_window_idx?: number;
+  last_window_idx?: number;
+  predicted_stage?: string;
+  infiltration_probability_world_model?: number;
+  infiltration_probability_baseline?: number;
+}
+
+export interface PcapUploadResult {
+  local_ip: string;
+  stats: {
+    packets_total: number;
+    packets_tcp: number;
+    packets_used: number;
+    capture_seconds: number;
+    windows: number;
+    remote_hosts: number;
+    remote_hosts_seen: number;
+    alerts: number;
+  };
+  hosts: IngestHostSummary[];
+}
+
+export interface SampleDataResult {
+  seed: number;
+  hosts: IngestHostSummary[];
+}
+
+export interface HostDetail {
+  host_id: string;
+  n_windows: number;
+  last_seen: string | null;
+  source: string;
+}
+
+export type WorkspaceCounts = Record<'traffic_windows' | 'inference_log' | 'tripwire_alerts' | 'packet_log' | 'sensors', number>;
+
+export interface MeResponse {
+  user_id: string;
+  auth_mode: 'supabase' | 'dev';
+  workspace: WorkspaceCounts;
 }
 
 // ---- SHAP (baseline) vs attention + saliency (LSTM) -------------------------

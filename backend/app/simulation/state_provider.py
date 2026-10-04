@@ -163,7 +163,7 @@ class NetworkStateProvider:
 
     def build_topology(self, target_host_id: str,
                        is_live: bool = False) -> TopologyConfig:
-        if is_live or target_host_id.startswith("live:"):
+        if is_live or target_host_id.startswith(("live:", "pcap:")):
             return self._build_live_topology(target_host_id)
         return self._build_demo_topology(target_host_id)
 
@@ -202,7 +202,7 @@ class NetworkStateProvider:
     # Live-capture topology
     # ------------------------------------------------------------------ #
     def _build_live_topology(self, target_host_id: str) -> TopologyConfig:
-        clean_id = target_host_id.replace("live:", "")
+        clean_id = target_host_id.replace("live:", "").replace("pcap:", "")
         target_ip = clean_id if "." in clean_id else "192.168.1.50"
 
         segments = {

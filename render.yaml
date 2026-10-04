@@ -1,0 +1,35 @@
+# Render Blueprint for the backend API (Dashboard -> New -> Blueprint -> this repo).
+# The frontend is deployed separately on Vercel, the database/auth is Supabase.
+# See DEPLOY.md for the step-by-step guide.
+services:
+  - type: web
+    name: nadf-backend
+    runtime: docker
+    rootDir: backend
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free
+    region: singapore
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # Supabase -> Connect -> "Session pooler" connection string (IPv4).
+      # postgresql://postgres.<project-ref>:<db-password>@aws-<n>-<region>.pooler.supabase.com:5432/postgres
+      - key: DATABASE_URL
+        sync: false
+      # Supabase -> Project Settings -> Data API -> Project URL, e.g. https://abcd1234.supabase.co
+      - key: SUPABASE_URL
+        sync: false
+      # Only for projects still using the legacy JWT secret (HS256). Leave empty
+      # if your project uses the new JWT signing keys (the default).
+      - key: SUPABASE_JWT_SECRET
+        sync: false
+      # Your Vercel site URL(s), comma separated, e.g. https://nadf.vercel.app
+      - key: CORS_ORIGINS
+        sync: false
+      # This service's own public URL (pre-filled into the downloadable agent).
+      # Optional: if unset it is taken from the request.
+      - key: PUBLIC_API_URL
+        sync: false
+      - key: MAX_UPLOAD_MB
+        value: "25"

@@ -1,11 +1,10 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api, STAGE_COLORS, STAGE_LABELS } from '../api';
-import type { AttackMapping, ForecastResponse, BranchingForecastResponse, SandboxTestResult } from '../types';
+import type { AttackMapping, ForecastResponse, BranchingForecastResponse } from '../types';
 import { pickInterestingWindowIdx } from '../hostWindow';
 import CardHeader from '../components/CardHeader';
 import TrajectoryChart, { type TrajectoryPoint } from '../components/TrajectoryChart';
 import BranchingForecastTree, { PathSummaryList } from '../components/BranchingForecastTree';
-import LiveCapturePanel from '../components/LiveCapturePanel';
 import AttackerStepTracker from '../components/AttackerStepTracker';
 import MitreForecastGraph from '../components/MitreForecastGraph';
 import AttackForecastDetails from '../components/AttackForecastDetails';
@@ -18,10 +17,7 @@ export default function Forecasts({ selectedHost, onSelectHost }: { selectedHost
   const [branching, setBranching] = useState<BranchingForecastResponse | null>(null);
   const [branchingLoading, setBranchingLoading] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [uploadResult, setUploadResult] = useState<SandboxTestResult | null>(null);
-  const [uploadError, setUploadError] = useState<string | null>(null);
   const [attackMapping, setAttackMapping] = useState<AttackMapping[]>([]);
-  const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     api.hosts().then((h) => {
@@ -59,53 +55,8 @@ export default function Forecasts({ selectedHost, onSelectHost }: { selectedHost
       ]
     : [];
 
-  async function handleFile(mode: 'test' | 'ingest') {
-    const file = fileRef.current?.files?.[0];
-    if (!file) return;
-    setUploadError(null);
-    setUploadResult(null);
-    try {
-      if (mode === 'test') {
-        const res = await api.sandboxTest(file);
-        setUploadResult(res);
-      } else {
-        const res = await api.ingest(file);
-        setUploadResult({ outcome: 'success', errors: [], rows: res.length, hosts: new Set(res.map((r) => r.host_id)).size });
-        if (res.length) onSelectHost(res[0].host_id);
-      }
-    } catch (e: any) {
-      setUploadError(e?.response?.data?.detail ?? String(e));
-    }
-  }
-
   return (
     <div className="flex flex-col gap-6">
-      <LiveCapturePanel />
-
-      <div className="card p-6">
-        <CardHeader title="CSV Ingestion" subtitle="Upload a synthetic-telemetry-shaped CSV to run real inference offline. /sandbox/test validates structure only; /ingest also runs the models." />
-        <div className="flex flex-wrap items-center gap-3">
-          <input ref={fileRef} type="file" accept=".csv" className="text-sm text-[var(--color-ink-dim)]" />
-          <button onClick={() => handleFile('test')} className="px-4 py-2 rounded-full bg-[var(--color-accent-soft)] text-[var(--color-accent)] text-sm font-medium flex items-center gap-2">
-            <UploadIcon size={14} /> Validate only
-          </button>
-          <button onClick={() => handleFile('ingest')} className="px-4 py-2 rounded-full bg-[var(--color-accent)] text-white text-sm font-medium flex items-center gap-2">
-            <UploadIcon size={14} /> Ingest &amp; forecast
-          </button>
-        </div>
-        {uploadResult && (
-          <div className={`mt-4 text-sm rounded-xl p-3 ${uploadResult.outcome === 'success' ? 'bg-[var(--color-good)]/10 text-[var(--color-good)]' : 'bg-[var(--color-bad)]/10 text-[var(--color-bad)]'}`}>
-            outcome: <strong>{uploadResult.outcome}</strong> — {uploadResult.rows} rows, {uploadResult.hosts} host(s)
-            {uploadResult.errors.length > 0 && (
-              <ul className="list-disc pl-5 mt-1">
-                {uploadResult.errors.map((e, i) => <li key={i}>{e}</li>)}
-              </ul>
-            )}
-          </div>
-        )}
-        {uploadError && <div className="mt-4 text-sm rounded-xl p-3 bg-[var(--color-bad)]/10 text-[var(--color-bad)]">{uploadError}</div>}
-      </div>
-
       <div className="card p-6">
         <div className="flex items-center justify-between mb-5 flex-wrap gap-3">
           <CardHeader title="Host Forecast Explorer" subtitle="Select a host to run a real one-step forecast + K-step rollout" />

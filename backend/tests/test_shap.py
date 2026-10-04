@@ -1,3 +1,4 @@
+import pytest
 import numpy as np
 
 from app.config import FEATURE_COLUMNS, N_FEATURES
@@ -42,3 +43,17 @@ def test_shap_output_shape_and_sorting():
     out = ex.explain(X[0], X[0], top_k=5)
     vals = [abs(c["shap_value"]) for c in out["contributions"]]
     assert len(vals) == 5 and vals == sorted(vals, reverse=True)
+
+
+def test_closed_form_matches_the_shap_library_linear_explainer():
+    """The server computes linear SHAP in closed form (no `shap` import);
+    it must give exactly what shap.LinearExplainer gives for the same model."""
+    shap = pytest.importorskip("shap")
+    X, y, _ = _separable_data()
+    clf = train_baseline(X, y)
+    background = X[y == 0][:100]
+    ours = BaselineShapExplainer(clf, background)
+    ref = shap.LinearExplainer(clf, background)
+    q = X[:20]
+    assert np.allclose(ours.shap_values(q), np.asarray(ref.shap_values(q)), atol=1e-8)
+    assert abs(ours.base_value - float(np.ravel(ref.expected_value)[0])) < 1e-8

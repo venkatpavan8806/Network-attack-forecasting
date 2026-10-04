@@ -15,11 +15,18 @@ Here it is a sample of NORMAL traffic windows, so every SHAP value reads as
 "how much did this feature push the baseline's score away from what normal
 traffic looks like". Values are in log-odds (the logistic regression's native
 output space); positive = pushes toward 'malicious', negative = toward 'normal'.
+
+Computation: for a linear model with the (default) independent-features
+masker, SHAP values have an exact closed form --
+    phi_i = coef_i * (x_i - mean(background_i)),  base = intercept + coef . mean(background)
+which is precisely what shap.LinearExplainer returns for this model
+(tests/test_shap.py checks the two agree). BaselineShapExplainer computes it
+directly so the web server does not have to import the `shap` package
+(~190 MB of RAM, too much for a 512 MB hosting instance).
 """
 from __future__ import annotations
 
 import numpy as np
-import shap
 
 from app.config import FEATURE_COLUMNS
 
@@ -29,6 +36,7 @@ def explain_baseline(clf, X_background: np.ndarray, X_query: np.ndarray, top_k: 
     X_query: (n, n_features) rows to explain.
     Returns list of {feature, shap_value} sorted by |shap_value| desc, per row.
     """
+    import shap  # heavy import, only needed by this offline helper
     explainer = shap.LinearExplainer(clf, X_background)
     shap_values = explainer.shap_values(X_query)  # (n, n_features)
     results = []
@@ -47,14 +55,19 @@ class BaselineShapExplainer:
         """clf: fitted LogisticRegression. X_background: (n, n_features) SCALED
         normal-traffic windows used as SHAP's reference point."""
         self.clf = clf
-        self.explainer = shap.LinearExplainer(clf, X_background)
-        self.base_value = float(np.ravel(self.explainer.expected_value)[0])
+        self.coef = np.asarray(clf.coef_, dtype=np.float64).reshape(-1)
+        self.background_mean = np.asarray(X_background, dtype=np.float64).mean(axis=0)
+        self.base_value = float(np.ravel(clf.intercept_)[0] + self.coef @ self.background_mean)
+
+    def shap_values(self, x_scaled: np.ndarray) -> np.ndarray:
+        """Exact linear SHAP values, shape (n, n_features)."""
+        return (np.asarray(x_scaled, dtype=np.float64) - self.background_mean) * self.coef
 
     def explain(self, x_scaled: np.ndarray, x_raw: np.ndarray, top_k: int = 8) -> dict:
         """x_scaled / x_raw: ONE window, shape (n_features,), same feature order
         as FEATURE_COLUMNS. x_raw is only used to show human-readable values."""
         x_scaled = np.asarray(x_scaled, dtype=np.float64).reshape(1, -1)
-        vals = np.asarray(self.explainer.shap_values(x_scaled))
+        vals = self.shap_values(x_scaled)
         if vals.ndim != 2 or vals.shape != x_scaled.shape:
             raise ValueError(f"unexpected SHAP output shape {vals.shape}; expected {x_scaled.shape}")
         vals = vals[0]

@@ -1,12 +1,15 @@
+# Runtime dependencies of the API server (installed in the Docker image).
+# torch is installed separately from the CPU-only wheel index in the Dockerfile
+# (the default PyPI torch wheel bundles ~2 GB of CUDA libraries).
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 pandas==2.2.2
 numpy==1.26.4
 scikit-learn==1.5.1
 torch==2.4.1
-shap==0.46.0
 pydantic==2.9.2
-pytest==8.3.3
 python-multipart==0.0.9
 scapy==2.7.0
-httpx==0.28.1
+SQLAlchemy==2.0.36
+psycopg[binary]==3.2.3
+PyJWT[crypto]==2.10.1
