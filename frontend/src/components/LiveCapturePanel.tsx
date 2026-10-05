@@ -5,7 +5,6 @@ import CardHeader from '../components/CardHeader';
 import AlertFeed from './AlertFeed';
 import LiveTrajectoryChart, { type LiveTrajectoryPoint } from './LiveTrajectoryChart';
 import PacketLogPanel from './PacketLogPanel';
-import AgentSetup from './AgentSetup';
 
 const SEQ_LEN = 8; // must match backend app.config.SEQ_LEN
 
@@ -29,23 +28,16 @@ export default function LiveCapturePanel() {
   const pollRef = useRef<number | null>(null);
   const autoStartAttempted = useRef(false);
 
-  // Interfaces come from the user's capture agent (or, for a local demo, the
-  // backend's own machine). While not capturing, keep checking: the agent may
-  // be started -- or stopped -- at any time.
   useEffect(() => {
-    if (status?.running) return;
-    const refresh = () => {
-      api.liveStatus().then(setStatus).catch(() => {});
-      api.liveInterfaces().then((list) => {
-        setInterfaces(list);
-        setSelected((cur) => (cur && list.some((i) => i.name === cur.name) ? cur
-          : list.find((i) => i.name.toLowerCase() === 'wi-fi') ?? list[0] ?? null));
-      }).catch(() => setInterfaces([]));
-    };
-    refresh();
-    const t = window.setInterval(refresh, 4000);
-    return () => window.clearInterval(t);
-  }, [status?.running]);
+    api.liveStatus().then((s) => {
+      setStatus(s);
+    }).catch(() => {});
+    api.liveInterfaces().then((list) => {
+      setInterfaces(list);
+      const wifi = list.find((i) => i.name.toLowerCase() === 'wi-fi') ?? list[0];
+      if (wifi) setSelected(wifi);
+    }).catch(() => {});
+  }, []);
 
   // opening this panel should start watching automatically -- no click required
   useEffect(() => {
@@ -152,13 +144,6 @@ export default function LiveCapturePanel() {
         subtitle="Real packets off this machine's own NIC, real feature extraction, real inference through the trained world model. Not synthetic. No promiscuous mode -- only traffic to/from this host is seen."
       />
 
-      {!status?.running && interfaces.length === 0 && <AgentSetup />}
-      {status?.agent_online && (
-        <p className="text-xs text-[var(--color-ink-dim)] mb-2">
-          Capture agent <strong>{status.agent_name}</strong> is online{status.agent_hostname ? <> on <strong>{status.agent_hostname}</strong></> : null} — the interfaces below are that computer's.
-        </p>
-      )}
-
       <div className="flex flex-wrap items-end gap-3 mb-2">
         <div>
           <label className="text-xs text-[var(--color-ink-faint)] mb-1.5 block">Interface</label>
@@ -178,7 +163,7 @@ export default function LiveCapturePanel() {
             Stop capture
           </button>
         ) : (
-          <button onClick={start} disabled={!selected} className="px-4 py-2 rounded-full bg-[var(--color-accent)] text-white text-sm font-medium disabled:opacity-50">
+          <button onClick={start} className="px-4 py-2 rounded-full bg-[var(--color-accent)] text-white text-sm font-medium">
             Start live capture
           </button>
         )}
@@ -192,9 +177,7 @@ export default function LiveCapturePanel() {
       <p className="text-xs text-[var(--color-ink-faint)] mb-2">
         {status?.running
           ? <>Watching traffic to/from <strong>{status.local_ip}</strong>.</>
-          : selected
-            ? <>Starts automatically on this interface — no click needed. Point the other laptop's attack tools at <strong>{selected.ip}</strong>.</>
-            : <>No capture interface available yet — set up the capture agent above.</>}
+          : <>Starts automatically on this interface — no click needed. Point the other laptop's attack tools at <strong>{selected?.ip}</strong>.</>}
       </p>
 
       {error && <div className="text-sm text-[var(--color-bad)] mb-2">{error}</div>}
@@ -214,7 +197,7 @@ export default function LiveCapturePanel() {
           </div>
           <div className="bg-[var(--color-accent-soft)] rounded-xl p-3">
             <div className="text-xs text-[var(--color-ink-dim)]">First forecast after</div>
-            <div className="text-lg font-bold text-[var(--color-ink)]">1 window (30 s) per host</div>
+            <div className="text-lg font-bold text-[var(--color-ink)]">~{SEQ_LEN * 30 / 60} min per host</div>
           </div>
         </div>
       )}

@@ -33,6 +33,7 @@ from collections import deque, defaultdict
 
 from app.config import WATCHED_PORTS
 from app.live.flow_tracker import PORT_SERVICE_NAMES
+from app import db
 
 MULTI_PORT_WINDOW_SECONDS = 3.0
 MULTI_PORT_THRESHOLD = 4
@@ -41,7 +42,6 @@ WATCHED_PORT_COOLDOWN_SECONDS = 5.0
 
 class Tripwire:
     def __init__(self):
-        self.owner: str | None = None  # user whose live capture these alerts belong to
         self._lock = threading.Lock()
         self._recent_syn_ports: dict[str, deque] = defaultdict(deque)
         self._last_watched_alert: dict[tuple[str, int], float] = {}
@@ -54,10 +54,7 @@ class Tripwire:
             self._last_watched_alert.clear()
 
     def _raise(self, remote_ip: str, message: str, severity: str, detail: dict) -> dict:
-        if self.owner is None:
-            return {"remote_ip": remote_ip, "message": message, "severity": severity, "detail": detail}
-        from app import db  # lazy: this module also runs inside the capture agent, which has no database
-        return db.log_tripwire_alert(self.owner, remote_ip, message, severity, detail)
+        return db.log_tripwire_alert(remote_ip, message, severity, detail)
 
     def on_inbound_syn(self, remote_ip: str, local_port: int, ts: float) -> list[dict]:
         """Call synchronously from the packet-capture callback for every
@@ -96,9 +93,8 @@ class Tripwire:
 
         return fired
 
-    def recent(self, user_id: str, limit: int = 50) -> list[dict]:
-        from app import db
-        return db.recent_tripwire_alerts(user_id, limit=limit)
+    def recent(self, limit: int = 50) -> list[dict]:
+        return db.recent_tripwire_alerts(limit=limit)
 
 
 tripwire = Tripwire()

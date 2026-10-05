@@ -19,7 +19,7 @@ from app.models.lstm_world_model import rollout
 
 
 def compute_calibration(model, labeled_df: pd.DataFrame, scaler, hosts: set,
-                         horizon: int, n_bins: int = 10, write: bool = True) -> dict:
+                         horizon: int, n_bins: int = 10) -> dict:
     from app.config import FEATURE_COLUMNS
 
     predicted, observed_label = [], []
@@ -60,9 +60,8 @@ def compute_calibration(model, labeled_df: pd.DataFrame, scaler, hosts: set,
         "horizon_windows": horizon,
         "n_points": int(len(predicted)),
         "bins": bin_stats,
-        "brier_score": float(np.mean((predicted - observed_label) ** 2)) if len(predicted) else None,
+        "brier_score": float(np.mean((predicted - observed_label) ** 2)),
     }
-    if write:
-        with open(CALIBRATION_JSON, "w") as f:
-            json.dump(report, f, indent=2)
+    with open(CALIBRATION_JSON, "w") as f:
+        json.dump(report, f, indent=2)
     return report

@@ -5,27 +5,10 @@ import type {
   SandboxTestResult, AttackMapping, MitigationInfo, CounterfactualResponse,
   HostTimelineEntry, LiveStatus, LiveWindowEntry, LiveInterface, TripwireAlert, LivePacket,
   ShapResponse, DefenseAdvice, BranchingForecastResponse, TrackResponse, StepTrackingReport,
-  ThresholdCalibrationReport, RobustnessReport, Sensor, CreatedSensor,
+  ThresholdCalibrationReport, RobustnessReport,
 } from './types';
-import { supabase } from './supabase';
 
-// Backend URL from VITE_API_URL (e.g. the Render service); locally '/api' is proxied by vite.config.ts.
-const API_BASE = ((import.meta.env.VITE_API_URL as string | undefined) || '/api').replace(/\/+$/, '');
-const client = axios.create({ baseURL: API_BASE });
-
-/** Where the capture agent zip is downloaded from (public file, no secrets inside). */
-export function agentDownloadUrl(): string {
-  // local dev: straight from the backend, so the agent is pre-filled with the backend's own address
-  return API_BASE.startsWith('http') ? `${API_BASE}/agent/download` : 'http://127.0.0.1:8000/agent/download';
-}
-
-// Send the signed-in user's Supabase token with every request, so the
-// backend returns only that user's own data.
-client.interceptors.request.use(async (config) => {
-  const { data } = (await supabase?.auth.getSession()) ?? { data: { session: null } };
-  if (data.session) config.headers.set('Authorization', `Bearer ${data.session.access_token}`);
-  return config;
-});
+const client = axios.create({ baseURL: '/api' });
 
 export const api = {
   health: () => client.get('/health').then((r) => r.data),
@@ -76,9 +59,6 @@ export const api = {
     form.append('file', file);
     return client.post<ForecastResponse[]>('/ingest', form).then((r) => r.data);
   },
-  sensors: () => client.get<Sensor[]>('/sensors').then((r) => r.data),
-  createSensor: (name: string) => client.post<CreatedSensor>('/sensors', { name }).then((r) => r.data),
-  deleteSensor: (id: string) => client.delete(`/sensors/${id}`).then((r) => r.data),
   liveInterfaces: () => client.get<LiveInterface[]>('/live/interfaces').then((r) => r.data),
   liveStatus: () => client.get<LiveStatus>('/live/status').then((r) => r.data),
   liveStart: (iface: string, localIp: string) =>

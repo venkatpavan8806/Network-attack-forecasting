@@ -131,7 +131,6 @@ export default function AttackerStepTracker({ hostId }: { hostId: string | null 
 
   useEffect(() => {
     if (!hostId) return;
-    const isLive = hostId.startsWith('live:');
     setLoading(true);
     setError(null);
     setPlaying(false);
@@ -139,20 +138,10 @@ export default function AttackerStepTracker({ hostId }: { hostId: string | null 
       .then((d) => {
         setData(d);
         const firstAttack = d.summary.first_attack_alert_step;
-        // live host: follow the newest window; recorded host: start at its first attack
-        setSel(isLive ? Math.max(0, d.steps.length - 1) : firstAttack ? Math.max(0, firstAttack - 1) : 0);
+        setSel(firstAttack ? Math.max(0, firstAttack - 1) : 0);
       })
       .catch((e) => { setData(null); setError(e?.response?.data?.detail ?? String(e)); })
       .finally(() => setLoading(false));
-    if (!isLive) return;
-    // live capture adds a window every 30 s: keep the track current (no spinner)
-    const t = window.setInterval(() => {
-      api.track(hostId).then((d) => {
-        setData(d);
-        setSel(Math.max(0, d.steps.length - 1));
-      }).catch(() => {});
-    }, 10000);
-    return () => window.clearInterval(t);
   }, [hostId]);
 
   useEffect(() => {

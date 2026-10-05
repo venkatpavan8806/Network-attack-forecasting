@@ -1,7 +1,5 @@
 import { BellIcon, LogIcon } from '../icons';
 import type { TabKey } from '../App';
-import { supabase } from '../supabase';
-import ProfileMenu from './ProfileMenu';
 
 const tabs: { key: TabKey; label: string; disabled?: boolean }[] = [
   { key: 'overview', label: 'Overview' },
@@ -32,14 +30,12 @@ export default function Topbar({ active, onChange }: { active: TabKey; onChange:
           <button className="w-10 h-10 rounded-full bg-white card flex items-center justify-center text-[var(--color-ink-dim)]">
             <BellIcon size={17} />
           </button>
-          <button
-            onClick={() => supabase?.auth.signOut()}
-            title="Sign out"
-            className="w-10 h-10 rounded-full bg-white card flex items-center justify-center text-[var(--color-ink-dim)]"
-          >
+          <button className="w-10 h-10 rounded-full bg-white card flex items-center justify-center text-[var(--color-ink-dim)]">
             <LogIcon size={17} />
           </button>
-          <ProfileMenu />
+          <div className="w-10 h-10 rounded-full bg-[var(--color-accent)] flex items-center justify-center text-white font-semibold text-sm">
+            SIH
+          </div>
         </div>
       </div>
 

@@ -21,23 +21,15 @@ export default function Forecasts({ selectedHost, onSelectHost }: { selectedHost
   const [uploadResult, setUploadResult] = useState<SandboxTestResult | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [attackMapping, setAttackMapping] = useState<AttackMapping[]>([]);
-  const [forecastError, setForecastError] = useState<string | null>(null);
-  const [liveUpdatedAt, setLiveUpdatedAt] = useState<number | null>(null);
-  const [, setClock] = useState(0);
   const fileRef = useRef<HTMLInputElement>(null);
 
-  // the host list includes live-captured hosts (live:<ip>), which appear as
-  // the capture runs -- so keep it fresh
   useEffect(() => {
-    const loadHosts = () => api.hosts().then((h) => {
+    api.hosts().then((h) => {
       setHosts(h);
       if (!selectedHost && h.length) onSelectHost(h[0]);
     }).catch(() => {});
-    loadHosts();
     api.attackMapping().then(setAttackMapping).catch(() => {});
-    const t = window.setInterval(loadHosts, 10000);
-    return () => window.clearInterval(t);
-  }, [selectedHost]);
+  }, []);
 
   useEffect(() => {
     if (!selectedHost) return;
@@ -45,25 +37,14 @@ export default function Forecasts({ selectedHost, onSelectHost }: { selectedHost
     setLoading(true);
     setBranchingLoading(true);
 
-    setForecastError(null);
-    setLiveUpdatedAt(null);
-
     const run = (atWindowIdx: number | undefined) => {
-      api.forecast(selectedHost, atWindowIdx)
-        .then((f) => { setForecast(f); setForecastError(null); if (isLive) setLiveUpdatedAt(Date.now()); })
-        .catch((e) => { setForecast(null); setForecastError(e?.response?.data?.detail ?? String(e)); })
-        .finally(() => setLoading(false));
-      api.branchingForecast(selectedHost, atWindowIdx).then(setBranching).catch(() => setBranching(null))
-        .finally(() => setBranchingLoading(false));
+      api.forecast(selectedHost, atWindowIdx).then(setForecast).finally(() => setLoading(false)).catch(() => setLoading(false));
+      api.branchingForecast(selectedHost, atWindowIdx).then(setBranching).finally(() => setBranchingLoading(false)).catch(() => setBranchingLoading(false));
     };
 
     if (isLive) {
-      // a live host gains a new window every 30 s while its capture runs:
-      // re-run the forecast every 10 s so the page follows it as it happens
       run(undefined);
-      const t = window.setInterval(() => run(undefined), 10000);
-      const tick = window.setInterval(() => setClock((c) => c + 1), 1000);
-      return () => { window.clearInterval(t); window.clearInterval(tick); };
+      return;
     }
     // Default to the end of the host's first non-benign segment instead of
     // its last window -- a demo host's timeline always ends in a benign
@@ -90,7 +71,6 @@ export default function Forecasts({ selectedHost, onSelectHost }: { selectedHost
       } else {
         const res = await api.ingest(file);
         setUploadResult({ outcome: 'success', errors: [], rows: res.length, hosts: new Set(res.map((r) => r.host_id)).size });
-        setHosts(await api.hosts()); // uploaded hosts are saved to this user's account
         if (res.length) onSelectHost(res[0].host_id);
       }
     } catch (e: any) {
@@ -148,20 +128,6 @@ export default function Forecasts({ selectedHost, onSelectHost }: { selectedHost
           </div>
         </div>
 
-        {selectedHost?.startsWith('live:') && (
-          <div className="flex items-center gap-2 text-xs mb-3">
-            <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-[var(--color-good)]/15 text-[#1f8a5c] font-semibold">
-              <span className="w-2 h-2 rounded-full bg-[var(--color-good)] animate-pulse" /> LIVE
-            </span>
-            <span className="text-[var(--color-ink-dim)]">
-              {liveUpdatedAt ? `updated ${Math.max(0, Math.round((Date.now() - liveUpdatedAt) / 1000))}s ago` : 'waiting for data'}
-              {forecast ? ` · window ${forecast.window_idx}` : ''} · refreshes as new 30-second windows are captured
-            </span>
-          </div>
-        )}
-        {!loading && forecastError && (
-          <div className="text-sm text-[var(--color-ink-dim)] py-6 text-center">{forecastError}</div>
-        )}
         {loading && <div className="text-sm text-[var(--color-ink-faint)] py-8 text-center">running inference…</div>}
 
         {!loading && forecast && (

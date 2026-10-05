@@ -49,15 +49,14 @@ function ScoreTable({ rows }: { rows: [string, MethodScores][] }) {
 
 export default function StepTrackingReportCard() {
   const [r, setR] = useState<StepTrackingReport | null>(null);
-  const [failed, setFailed] = useState(false);
-  useEffect(() => { api.stepTrackingReport().then(setR).catch(() => setFailed(true)); }, []);
+  useEffect(() => { api.stepTrackingReport().then(setR).catch(() => {}); }, []);
 
   if (!r) {
     return (
       <div className="card p-6">
         <CardHeader title="Step-by-Step Tracking & Next 1/2/3-Move Prediction" />
         <div className="h-32 flex items-center justify-center text-sm text-[var(--color-ink-faint)]">
-          {failed ? 'No labelled traffic yet — upload a CSV with a true_stage column (Forecasts → CSV Ingestion) to see this computed on your data.' : 'loading…'}
+          not yet available — run `python -m app.evaluate_step_tracking`
         </div>
       </div>
     );
@@ -65,11 +64,10 @@ export default function StepTrackingReportCard() {
 
   const w = r.window_level_tracking;
   const warmKey = Object.keys(w).find((k) => k.startsWith('accuracy_warmup_windows'));
-  const multi = r.multi_step_moves; // null when the upload has no attacking hosts
-  const h2h = multi?.heldout_hosts_vs_lstm ?? { hosts: [], note: '' };
+  const h2h = r.multi_step_moves.heldout_hosts_vs_lstm;
   const h2hRows = (['markov_order1', 'trigram_order2', 'lstm_only', 'hybrid_trigram_plus_lstm'] as const)
     .filter((k) => h2h[k]).map((k) => [k, h2h[k] as MethodScores] as [string, MethodScores]);
-  const lohoRows = Object.entries(multi?.leave_one_host_out_all_attack_hosts ?? {});
+  const lohoRows = Object.entries(r.multi_step_moves.leave_one_host_out_all_attack_hosts);
   const chart = (['next_1', 'next_2', 'next_3'] as const).map((k) => {
     const row: Record<string, any> = { horizon: k.replace('next_', 'Next ') + (k === 'next_1' ? ' move' : ' moves') };
     for (const [name, s] of h2hRows) if (s[k]) row[name] = s[k]!.exact_match;
@@ -93,7 +91,7 @@ export default function StepTrackingReportCard() {
       </div>
 
       <div>
-        <h4 className="text-sm font-semibold text-[var(--color-ink)] mb-2">Prediction after every window (your hosts, {w.n_predictions} predictions)</h4>
+        <h4 className="text-sm font-semibold text-[var(--color-ink)] mb-2">Prediction after every window (held-out hosts, {w.n_predictions} predictions)</h4>
         <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3 text-center">
           {[
             ['Top-1 accuracy', w.accuracy_top1],
@@ -118,8 +116,7 @@ export default function StepTrackingReportCard() {
 
       <div>
         <h4 className="text-sm font-semibold text-[var(--color-ink)] mb-1">Predicting the next 1, 2 and 3 moves: algorithms compared</h4>
-        {!multi && <p className="text-xs text-[var(--color-ink-faint)]">Needs at least one attacking host in your uploaded traffic.</p>}
-        {multi && <p className="text-[11px] text-[var(--color-ink-faint)] mb-3">{multi.unit}</p>}
+        <p className="text-[11px] text-[var(--color-ink-faint)] mb-3">{r.multi_step_moves.unit}</p>
         <div className="h-64">
           <ResponsiveContainer width="100%" height="100%">
             <BarChart data={chart} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
@@ -136,7 +133,7 @@ export default function StepTrackingReportCard() {
         </div>
         <div className="grid grid-cols-1 xl:grid-cols-2 gap-6 mt-4">
           <div>
-            <div className="text-xs font-semibold text-[var(--color-ink)] mb-1">Your attack hosts ({h2h.hosts.join(', ')})</div>
+            <div className="text-xs font-semibold text-[var(--color-ink)] mb-1">Held-out attack hosts ({h2h.hosts.join(', ')})</div>
             <ScoreTable rows={h2hRows} />
             <p className="text-[11px] text-[var(--color-ink-faint)] mt-1">{h2h.note}</p>
           </div>

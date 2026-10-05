@@ -5,9 +5,6 @@ no fixed/dummy outputs regardless of input, per the project's anti-stub rule.
 from __future__ import annotations
 
 import json
-import threading
-from collections import OrderedDict
-from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -35,10 +32,9 @@ from app.simulation.counterfactual import compare_with_and_without, rollout_coun
 from app.simulation.sandbox import DigitalTwinSandbox
 from app import db
 from app.models.ngram_move_model import NGramMoveModel, NGRAM_MODEL_JSON, labels_to_moves
-from app.tracking.step_tracker import track_host, padded_window
+from app.tracking.step_tracker import track_host
 
 SHAP_BACKGROUND_SIZE = 200  # normal-traffic windows used as SHAP's reference point
-USER_CACHE_SIZE = 32  # users whose data is kept in memory
 
 
 class ArtifactsNotReadyError(RuntimeError):
@@ -77,9 +73,6 @@ class InferenceService:
         self.stage_mean_vectors: dict | None = None
         self.shap_explainer: BaselineShapExplainer | None = None
         self.ngram: NGramMoveModel | None = None
-        self._user_cache: OrderedDict[str, pd.DataFrame] = OrderedDict()
-        self._report_cache: dict[str, dict] = {}
-        self._report_lock = threading.Lock()  # the Benchmarks page asks for 5 reports at once: compute once
         self.ready = False
 
     def load(self):
@@ -111,6 +104,7 @@ class InferenceService:
         self.ngram = self._load_ngram()
 
         db.init_db()
+        db.seed_from_training_log()
         self.ready = True
 
     def _build_shap_explainer(self) -> BaselineShapExplainer | None:
@@ -138,30 +132,6 @@ class InferenceService:
                 for _, g in self.labeled_df.groupby("host_id")]
         seqs = [s for s in seqs if s]
         return NGramMoveModel(order=3).fit(seqs) if seqs else None
-
-    # -- each user's own data: only what they uploaded ---------------------
-    def _remember(self, user_id: str, df: pd.DataFrame):
-        self._user_cache[user_id] = df
-        self._user_cache.move_to_end(user_id)
-        while len(self._user_cache) > USER_CACHE_SIZE:
-            self._user_cache.popitem(last=False)
-
-    def user_df(self, user_id: str) -> pd.DataFrame:
-        """The user's own data: every host they uploaded (empty for a new user)."""
-        df = self._user_cache.get(user_id)
-        if df is None:
-            df = db.user_frame(user_id)
-            self._remember(user_id, df)
-        else:
-            self._user_cache.move_to_end(user_id)
-        return df
-
-    def _host_rows(self, user_id: str, host_id: str) -> pd.DataFrame:
-        df = self.user_df(user_id)
-        host_df = df[df["host_id"] == host_id]
-        if len(host_df) == 0:
-            raise ValueError(f"unknown host_id: {host_id}")
-        return host_df
 
     # -- validation -----------------------------------------------------
     def validate_telemetry_csv(self, df: pd.DataFrame) -> list[str]:
@@ -193,8 +163,7 @@ class InferenceService:
         feats = self.scaler.transform(host_df[FEATURE_COLUMNS].values).astype(np.float32)
         return feats[end_pos - SEQ_LEN + 1: end_pos + 1]
 
-    def forecast_host_from_dataframe(self, host_id: str, host_df: pd.DataFrame, log_source: str = "live",
-                                     user_id: str | None = None):
+    def forecast_host_from_dataframe(self, host_id: str, host_df: pd.DataFrame, log_source: str = "live"):
         """host_df: rows for ONE host, sorted by window_idx ascending, with
         FEATURE_COLUMNS present. Runs one-step forecast + K-step rollout +
         explainability from the LAST available window, and the baseline's
@@ -219,11 +188,10 @@ class InferenceService:
         predicted_stage = max(explanation["stage_probabilities"].items(), key=lambda kv: kv[1])[0]
         stage_mapping = map_stage(predicted_stage)
 
-        if user_id is not None:
-            db.log_inference(user_id, host_id, window_idx, "world_model_lstm", predicted_stage,
-                             explanation["infiltration_probability"], true_stage, state_label, source=log_source)
-            db.log_inference(user_id, host_id, window_idx, "baseline_logreg", None,
-                             baseline_prob, true_stage, state_label, source=log_source)
+        db.log_inference(host_id, window_idx, "world_model_lstm", predicted_stage,
+                          explanation["infiltration_probability"], true_stage, state_label, source=log_source)
+        db.log_inference(host_id, window_idx, "baseline_logreg", None,
+                          baseline_prob, true_stage, state_label, source=log_source)
 
         return {
             "host_id": host_id,
@@ -247,43 +215,57 @@ class InferenceService:
             "state_label": state_label,
         }
 
-    def forecast_demo_host(self, user_id: str, host_id: str, at_window_idx: int | None = None):
-        host_df = self._host_rows(user_id, host_id)
+    def forecast_demo_host(self, host_id: str, at_window_idx: int | None = None):
+        if host_id.startswith("live:"):
+            if at_window_idx is not None:
+                raise ValueError("at_window_idx is not supported for live hosts -- live capture only keeps the most recent 8 windows, there's no history to rewind to")
+            return self.forecast_live_host(host_id[len("live:"):])
+        if self.labeled_df is None:
+            raise ArtifactsNotReadyError("no dataset loaded; run app.train first")
+        host_df = self.labeled_df[self.labeled_df["host_id"] == host_id]
+        if len(host_df) == 0:
+            raise ValueError(f"unknown host_id: {host_id}")
         if at_window_idx is not None:
             host_df = host_df[host_df["window_idx"] <= at_window_idx]
-        if len(host_df) < SEQ_LEN:
-            raise ValueError(f"host '{host_id}' has {len(host_df)}/{SEQ_LEN} windows of history -- not enough yet")
-        source = "live_capture" if host_id.startswith("live:") else "live"
-        return self.forecast_host_from_dataframe(host_id, host_df, log_source=source, user_id=user_id)
+            if len(host_df) < SEQ_LEN:
+                raise ValueError(f"host '{host_id}' has fewer than {SEQ_LEN} windows at/before window {at_window_idx}")
+        return self.forecast_host_from_dataframe(host_id, host_df, log_source="live")
 
-    # -- live capture: every captured window lands here ------------------------
-    def ingest_live_window(self, user_id: str, remote_ip: str, features: dict) -> dict:
-        """One 30-second window of real captured traffic for one remote host
-        (from the user's capture agent, or from app/live/capture.py when the
-        backend runs on the monitored machine). Saved to the user's own hosts
-        as `live:<ip>` -- so it appears on Forecasts and every other page --
-        and predicted immediately, from the first window (warm-up windows
-        are left-padded, see app/tracking/step_tracker.py:padded_window)."""
-        host_id = f"live:{remote_ip}"
-        window_idx = db.append_user_window(user_id, host_id, features)
-        self._user_cache.pop(user_id, None)
+    # -- live-capture hosts: same inference, sourced from the live capture's
+    # own rolling raw-feature history instead of the synthetic demo dataset --
+    def _live_history_raw(self, remote_ip: str) -> tuple[np.ndarray, int]:
+        """Returns (raw_window_array, window_idx) for a live-captured remote
+        host, or raises ValueError with a clear reason if it's not ready."""
+        from app.live.capture import live_capture
+        if not live_capture.running:
+            raise ValueError(f"live capture is not running -- cannot forecast live host '{remote_ip}'")
+        hist = live_capture.history.get(remote_ip)
+        if hist is None or len(hist) < SEQ_LEN:
+            have = 0 if hist is None else len(hist)
+            raise ValueError(f"live host '{remote_ip}' has {have}/{SEQ_LEN} windows of history -- not enough yet")
+        window_idx = live_capture.window_counter.get(remote_ip, len(hist))
+        return np.stack(list(hist)).astype(np.float32), window_idx
 
-        rows = self._host_rows(user_id, host_id).sort_values("window_idx").tail(SEQ_LEN)
-        window_scaled = self.scaler.transform(rows[FEATURE_COLUMNS].values).astype(np.float32)
-        window_scaled, n_real = padded_window(window_scaled, len(window_scaled) - 1)
+    def forecast_live_host(self, remote_ip: str):
+        """Same real inference as forecast_host_from_dataframe (attention +
+        saliency explanation, K-step rollout, branching forecast), sourced
+        from live capture's raw window history instead of the demo dataset.
+        Does not re-log to the inference table -- that already happened once
+        when the window was first processed by app/live/capture.py; this is
+        an on-demand recomputation for the UI, not a new observation."""
+        window_raw, window_idx = self._live_history_raw(remote_ip)
+        window_scaled = self.scaler.transform(window_raw).astype(np.float32)
         explanation = explain_prediction(self.model, window_scaled)
+        roll = lstm_rollout(self.model, window_scaled, k=ROLLOUT_K)
         baseline_prob = float(self.baseline.predict_proba(window_scaled[-1:])[0, 1])
         predicted_stage = max(explanation["stage_probabilities"].items(), key=lambda kv: kv[1])[0]
+        stage_mapping = map_stage(predicted_stage)
 
-        entry = {
-            "host_id": host_id,
+        return {
+            "host_id": f"live:{remote_ip}",
             "window_idx": window_idx,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "raw_features": {c: float(features[c]) for c in FEATURE_COLUMNS},
-            "history_windows_used": int(n_real),
-            "warmup": bool(n_real < SEQ_LEN),
             "predicted_stage": predicted_stage,
-            "attack_mapping": map_stage(predicted_stage),
+            "attack_mapping": stage_mapping,
             "infiltration_probability_world_model": explanation["infiltration_probability"],
             "infiltration_probability_baseline": round(baseline_prob, 4),
             "stage_probabilities": explanation["stage_probabilities"],
@@ -291,23 +273,26 @@ class InferenceService:
                 "attention_over_past_windows": explanation["attention_over_past_windows"],
                 "top_contributors": explanation["top_contributors"],
             },
+            "rollout": {
+                "horizon_windows": ROLLOUT_K,
+                "infiltration_probs_world_model": [round(p, 4) for p in roll["infiltration_probs"]],
+                "predicted_stage_per_horizon": roll["predicted_stage"],
+                "branching_forecast": _build_branching_forecast(roll["stage_probs"]),
+            },
+            "true_stage": None,
+            "state_label": None,
         }
-        db.add_live_entry(user_id, entry)
-        db.log_inference(user_id, host_id, window_idx, "world_model_lstm", predicted_stage,
-                         explanation["infiltration_probability"], None, None, source="live_capture")
-        db.log_inference(user_id, host_id, window_idx, "baseline_logreg", None,
-                         baseline_prob, None, None, source="live_capture")
-        return entry
 
-    def live_hosts_with_predictions(self, user_id: str) -> list[str]:
-        """The user's live-captured hosts with enough window history to be
-        forecastable/explainable (eligible for Explainability and Digital Twin)."""
-        df = self.user_df(user_id)
-        live = df[df["host_id"].str.startswith("live:")]
-        counts = live.groupby("host_id").size()
-        return sorted(counts[counts >= SEQ_LEN].index.tolist())
+    def live_hosts_with_predictions(self) -> list[str]:
+        """Live-captured hosts that have accumulated enough windows to be
+        forecastable/explainable right now (i.e. eligible for Explainability
+        and Digital Twin, not just the Live Capture table's own view)."""
+        from app.live.capture import live_capture
+        if not live_capture.running:
+            return []
+        return [f"live:{ip}" for ip, hist in live_capture.history.items() if len(hist) >= SEQ_LEN]
 
-    def branching_forecast(self, user_id: str, host_id: str, at_window_idx: int | None = None,
+    def branching_forecast(self, host_id: str, at_window_idx: int | None = None,
                             depth: int | None = None, branch_factor: int | None = None):
         """K-step forecast as a branching attack-path TREE (see
         app/models/lstm_world_model.py:branching_rollout) instead of the
@@ -320,7 +305,11 @@ class InferenceService:
         keep SEQ_LEN windows of raw history, which the linear rollout's own
         `branching_forecast` field (see _build_branching_forecast above)
         already covers per-horizon."""
-        host_df = self._host_rows(user_id, host_id)
+        if self.labeled_df is None:
+            raise ArtifactsNotReadyError("no dataset loaded; run app.train first")
+        host_df = self.labeled_df[self.labeled_df["host_id"] == host_id]
+        if len(host_df) == 0:
+            raise ValueError(f"unknown host_id: {host_id}")
         if at_window_idx is not None:
             host_df = host_df[host_df["window_idx"] <= at_window_idx]
         host_df = host_df.sort_values("window_idx").reset_index(drop=True)
@@ -354,32 +343,15 @@ class InferenceService:
             "state_label": last_row.get("state_label"),
         }
 
-    def ingest_csv(self, user_id: str, df: pd.DataFrame):
-        """Parses an uploaded telemetry CSV, saves every host in it to the
-        user's own data (re-uploading a host replaces it), so it appears in
-        their host list and on every page, and runs real inference for the
-        LAST window of every host present in it."""
+    def ingest_csv(self, df: pd.DataFrame):
+        """Parses an uploaded CSV of synthetic-telemetry-shaped rows and runs
+        real inference for the LAST window of every host present in it."""
         errors = self.validate_telemetry_csv(df)
         if errors:
             raise ValueError("; ".join(errors))
-        stored = df.copy()
-        stored["host_id"] = stored["host_id"].astype(str)
-        # labelled upload (ground-truth true_stage) without state labels: derive them with the
-        # project's state-labeling engine, so the step tracker and Benchmarks can score it
-        if "true_stage" in stored.columns and stored["true_stage"].notna().all() and (
-                "state_label" not in stored.columns or stored["state_label"].isna().any()):
-            stored = derive_state_labels(stored.drop(columns=["state_label"], errors="ignore"))
-        for col in ("true_stage", "state_label"):
-            if col not in stored.columns:
-                stored[col] = None
-            stored[col] = stored[col].where(stored[col].notna(), None)
-        db.replace_user_hosts(user_id, stored[["host_id", "window_idx", "true_stage", "state_label"] + FEATURE_COLUMNS])
-        self._user_cache.pop(user_id, None)
-        self._report_cache.pop(user_id, None)
         results = []
         for host_id, host_df in df.groupby("host_id"):
-            results.append(self.forecast_host_from_dataframe(str(host_id), host_df, log_source="ingest",
-                                                             user_id=user_id))
+            results.append(self.forecast_host_from_dataframe(str(host_id), host_df, log_source="ingest"))
         return results
 
     # -- digital twin: model-based counterfactual + network state sandbox -------------
@@ -396,12 +368,23 @@ class InferenceService:
             is_live=is_live,
         )
 
-    def run_counterfactual(self, user_id: str, host_id: str, mitigation_id: str, at_window_idx: int | None = None):
+    def run_counterfactual(self, host_id: str, mitigation_id: str, at_window_idx: int | None = None):
         """Compares the world model's predicted infiltration trajectory with
         and without a named mitigation applied to the cloned Digital Twin network
         state, starting from the host's real most-recent observed window (or
         `at_window_idx`). Safe sandbox simulation -- real_network_touched: false."""
-        host_df = self._host_rows(user_id, host_id).sort_values("window_idx").reset_index(drop=True)
+        if host_id.startswith("live:"):
+            if at_window_idx is not None:
+                raise ValueError("at_window_idx is not supported for live hosts -- live capture only keeps the most recent 8 windows, there's no history to rewind to")
+            remote_ip = host_id[len("live:"):]
+            seed_raw, window_idx = self._live_history_raw(remote_ip)
+            return self._counterfactual_result(host_id, window_idx, mitigation_id, seed_raw, is_live=True)
+
+        if self.labeled_df is None:
+            raise ArtifactsNotReadyError("no dataset loaded; run app.train first")
+        host_df = self.labeled_df[self.labeled_df["host_id"] == host_id].sort_values("window_idx").reset_index(drop=True)
+        if len(host_df) == 0:
+            raise ValueError(f"unknown host_id: {host_id}")
         if at_window_idx is not None:
             host_df = host_df[host_df["window_idx"] <= at_window_idx].reset_index(drop=True)
         if len(host_df) < SEQ_LEN:
@@ -413,22 +396,40 @@ class InferenceService:
         return self._counterfactual_result(
             host_id, int(last_row["window_idx"]), mitigation_id, seed_raw,
             true_stage=last_row.get("true_stage"), state_label=last_row.get("state_label"),
-            is_live=host_id.startswith("live:"),
+            is_live=False,
         )
 
     def available_mitigations(self):
         return list_mitigations()
 
-    def list_demo_hosts(self, user_id: str):
-        return sorted(self.user_df(user_id)["host_id"].unique().tolist())
+    def list_demo_hosts(self):
+        if self.labeled_df is None:
+            return []
+        return sorted(self.labeled_df["host_id"].unique().tolist())
 
     # -- shared: raw seed window for a demo host OR a live-capture host --------
-    def _raw_seed(self, user_id: str, host_id: str, at_window_idx: int | None = None):
+    def _raw_seed(self, host_id: str, at_window_idx: int | None = None):
         """Returns (seed_raw, window_idx, true_stage, state_label) where seed_raw is the
         RAW (unscaled) (SEQ_LEN, n_features) window ending at the host's latest window
         (or `at_window_idx`). Works for CSV/demo hosts and for `live:<ip>` hosts,
         whose history is whatever the live packet capture has really accumulated."""
-        host_df = self._host_rows(user_id, host_id).sort_values("window_idx").reset_index(drop=True)
+        if host_id.startswith("live:"):
+            from app.live.capture import live_capture  # local import: avoids a circular import at load time
+            remote_ip = host_id[len("live:"):]
+            hist = live_capture.history.get(remote_ip)
+            if hist is None:
+                raise ValueError(f"unknown host_id: {host_id} (not seen by the live capture)")
+            rows = list(hist)
+            if len(rows) < SEQ_LEN:
+                raise ValueError(f"live host '{host_id}' has {len(rows)}/{SEQ_LEN} windows of history so far")
+            return (np.stack(rows).astype(np.float32),
+                    int(live_capture.window_counter.get(remote_ip, len(rows))), None, None)
+
+        if self.labeled_df is None:
+            raise ArtifactsNotReadyError("no dataset loaded; run app.train first")
+        host_df = self.labeled_df[self.labeled_df["host_id"] == host_id].sort_values("window_idx").reset_index(drop=True)
+        if len(host_df) == 0:
+            raise ValueError(f"unknown host_id: {host_id}")
         if at_window_idx is not None:
             host_df = host_df[host_df["window_idx"] <= at_window_idx].reset_index(drop=True)
         if len(host_df) < SEQ_LEN:
@@ -439,14 +440,14 @@ class InferenceService:
         return seed_raw, int(last_row["window_idx"]), last_row.get("true_stage"), last_row.get("state_label")
 
     # -- SHAP (baseline) next to attention + saliency (LSTM) --------------------
-    def explain_shap(self, user_id: str, host_id: str, at_window_idx: int | None = None, top_k: int = 8):
+    def explain_shap(self, host_id: str, at_window_idx: int | None = None, top_k: int = 8):
         """Two explanations of the SAME moment, side by side:
           * SHAP on the logistic-regression baseline (sees only the current window)
           * attention x input-gradient saliency on the LSTM (sees the last SEQ_LEN windows)
         plus how much their top features agree."""
         if self.shap_explainer is None:
             raise ArtifactsNotReadyError("SHAP explainer unavailable: no normal-traffic reference data loaded")
-        seed_raw, window_idx, true_stage, state_label = self._raw_seed(user_id, host_id, at_window_idx)
+        seed_raw, window_idx, true_stage, state_label = self._raw_seed(host_id, at_window_idx)
         seed_scaled = self.scaler.transform(seed_raw).astype(np.float32)
 
         shap_out = self.shap_explainer.explain(seed_scaled[-1], seed_raw[-1], top_k=top_k)
@@ -481,8 +482,8 @@ class InferenceService:
         }
 
     # -- defense: rank every mitigation by what the world model says it achieves ---
-    def defense_advice(self, user_id: str, host_id: str, at_window_idx: int | None = None):
-        seed_raw, window_idx, true_stage, state_label = self._raw_seed(user_id, host_id, at_window_idx)
+    def defense_advice(self, host_id: str, at_window_idx: int | None = None):
+        seed_raw, window_idx, true_stage, state_label = self._raw_seed(host_id, at_window_idx)
         seed_scaled = self.scaler.transform(seed_raw).astype(np.float32)
 
         unmitigated = lstm_rollout(self.model, seed_scaled, k=ROLLOUT_K)
@@ -503,45 +504,35 @@ class InferenceService:
         return advice
 
     # -- step-by-step attacker tracking (prediction after EVERY window) ----
-    def track_attacker(self, user_id: str, host_id: str, at_window_idx: int | None = None):
+    def track_attacker(self, host_id: str, at_window_idx: int | None = None):
         """Walks the host's timeline from its FIRST window and predicts the
         attacker's next step after each one -- no SEQ_LEN warm-up gap (see
         app/tracking/step_tracker.py). Works for demo/CSV hosts and for
-        `live:<ip>` hosts (their saved live-capture windows). Ground truth is
-        used for scoring only when the host has labels (labelled CSV uploads)."""
-        host_df = self._host_rows(user_id, host_id).sort_values("window_idx")
-        if at_window_idx is not None:
-            host_df = host_df[host_df["window_idx"] <= at_window_idx]
-        raw = host_df[FEATURE_COLUMNS].values
-        widx = host_df["window_idx"].astype(int).tolist()
-        labels = host_df["state_label"].tolist() if host_df["state_label"].notna().all() else None
+        `live:<ip>` hosts (from the live capture's full window history)."""
+        if host_id.startswith("live:"):
+            from app.live.capture import live_capture
+            remote_ip = host_id[len("live:"):]
+            rows = live_capture.full_history.get(remote_ip)
+            if not rows:
+                raise ValueError(f"unknown host_id: {host_id} (not seen by the live capture)")
+            raw = np.stack(rows).astype(np.float32)
+            widx = list(range(1, len(rows) + 1))
+            labels = None
+        else:
+            if self.labeled_df is None:
+                raise ArtifactsNotReadyError("no dataset loaded; run app.train first")
+            host_df = self.labeled_df[self.labeled_df["host_id"] == host_id].sort_values("window_idx")
+            if len(host_df) == 0:
+                raise ValueError(f"unknown host_id: {host_id}")
+            if at_window_idx is not None:
+                host_df = host_df[host_df["window_idx"] <= at_window_idx]
+            raw = host_df[FEATURE_COLUMNS].values
+            widx = host_df["window_idx"].astype(int).tolist()
+            labels = host_df["state_label"].tolist() if "state_label" in host_df.columns else None
         feats = self.scaler.transform(raw).astype(np.float32)
         result = track_host(self.model, feats, widx, labels=labels, ngram=self.ngram)
         result["host_id"] = host_id
         return result
-
-    def user_reports(self, user_id: str) -> dict:
-        """Benchmarks computed from this user's own labelled uploads (see
-        app/evaluation/user_reports.py); cached until their next upload."""
-        reports = self._report_cache.get(user_id)
-        if reports is None:
-            with self._report_lock:
-                reports = self._report_cache.get(user_id)
-                if reports is None:
-                    from app.evaluation.user_reports import build_user_reports
-                    reports = build_user_reports(self.model, self.baseline, self.scaler, self.ngram,
-                                                 self.user_df(user_id))
-                    self._report_cache[user_id] = reports
-        return reports
-
-    def cached_user_reports(self, user_id: str) -> dict | None:
-        """The user's Benchmarks if already computed; otherwise starts computing
-        them in the background and returns None (so e.g. the Overview KPIs never
-        wait several seconds for the full Benchmarks computation)."""
-        reports = self._report_cache.get(user_id)
-        if reports is None and not self._report_lock.locked():
-            threading.Thread(target=self.user_reports, args=(user_id,), daemon=True).start()
-        return reports
 
     def step_tracking_report(self):
         from app.evaluate_step_tracking import STEP_TRACKING_JSON

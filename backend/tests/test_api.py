@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from fastapi.testclient import TestClient
 
 from app import db
-from app.config import FEATURE_COLUMNS, N_FEATURES, SEQ_LEN, STAGE_CLASSES
+from app.config import N_FEATURES, SEQ_LEN, STAGE_CLASSES
 from app.data_gen.generator import generate_dataset
 from app.labeling.state_labeler import derive_state_labels
 from app.features.extraction import host_split, fit_scaler, build_sequences, build_single_window_table
@@ -79,15 +79,9 @@ def client(real_service, tmp_path, monkeypatch):
     module-level `service` it dispatches to swapped for our fast, real,
     already-trained one, and the DB pointed at a throwaway file."""
     monkeypatch.setattr(main_module, "service", real_service)
-    db.configure(f"sqlite:///{(tmp_path / 'test_api_state.sqlite3').as_posix()}")
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test_api_state.sqlite3")
     db.init_db()
-    real_service._user_cache.clear()
-    real_service._report_cache.clear()
-    c = TestClient(main_module.app)
-    # the (dev-mode) user uploads their traffic, exactly like the website's CSV upload
-    csv = real_service.labeled_df.to_csv(index=False).encode()
-    assert c.post("/ingest", files={"file": ("telemetry.csv", csv, "text/csv")}).status_code == 200
-    return c
+    return TestClient(main_module.app)
 
 
 def _demo_host_id(real_service) -> str:
@@ -97,7 +91,7 @@ def _demo_host_id(real_service) -> str:
 def test_health_reports_ready(client):
     r = client.get("/health")
     assert r.status_code == 200
-    assert r.json() == {"status": "ok", "ready": True, "problem": None}
+    assert r.json() == {"status": "ok", "ready": True}
 
 
 def test_hosts_lists_real_hosts(client, real_service):
@@ -194,86 +188,14 @@ def test_stage_classes_route(client):
     assert "benign" in r.json()
 
 
-def test_benchmarks_are_computed_from_the_users_own_labelled_uploads(client):
-    """The fixture user uploaded labelled traffic: every Benchmarks report is
-    computed from it (not from the training run)."""
-    for path in ("/benchmark", "/calibration", "/lead-time", "/threshold-calibration", "/step-tracking-report"):
-        r = client.get(path)
-        assert r.status_code == 200, (path, r.text)
-    bench = client.get("/benchmark").json()
-    assert "your own uploaded" in bench["note"]
-    assert bench["world_model_lstm"]["n_samples"] > 0
-    lead = client.get("/lead-time").json()
-    assert {h["split"] for h in lead["per_host"]} == {"uploaded"}
-
-
-def test_benchmarks_are_blank_for_a_user_without_labelled_data(client, monkeypatch):
-    import jwt
-    from datetime import datetime, timedelta, timezone
-    from app import auth
-    monkeypatch.setattr(auth, "DEV_MODE", False)
-    monkeypatch.setattr(auth, "SUPABASE_URL", "https://example.supabase.co")
-    monkeypatch.setattr(auth, "JWT_SECRET", "test-secret-test-secret-test-secret")
-    token = jwt.encode({"sub": "someone-else", "aud": "authenticated",
-                        "exp": datetime.now(timezone.utc) + timedelta(minutes=5)},
-                       "test-secret-test-secret-test-secret", algorithm="HS256")
-    for path in ("/benchmark", "/calibration", "/lead-time", "/threshold-calibration", "/step-tracking-report"):
-        r = client.get(path, headers={"Authorization": f"Bearer {token}"})
-        assert r.status_code == 404 and "No labelled traffic yet" in r.json()["detail"]
-
-
-def test_upload_with_only_true_stage_gets_state_labels_derived(real_service, tmp_path):
-    db.configure(f"sqlite:///{(tmp_path / 'derive.sqlite3').as_posix()}")
-    db.init_db()
-    real_service._user_cache.clear()
-    real_service._report_cache.clear()
-    host = real_service.labeled_df[real_service.labeled_df["host_id"] == "attack-host-000"]
-    real_service.ingest_csv("carol", host.drop(columns=["state_label"]))
-    assert real_service.user_df("carol")["state_label"].notna().all()
-
-
-def test_new_user_starts_blank_and_sees_only_what_they_upload(real_service, tmp_path):
-    """No pre-loaded or generated data: a new account is empty, and an
-    upload appears only in the uploader's own account."""
-    db.configure(f"sqlite:///{(tmp_path / 'users.sqlite3').as_posix()}")
-    db.init_db()
-    real_service._user_cache.clear()
-    assert real_service.list_demo_hosts("alice") == []
-    assert db.recent_forecast_log("alice") == []
-    assert db.highest_risk_host("alice") is None
-
-    one_host = real_service.labeled_df[real_service.labeled_df["host_id"] == "attack-host-000"]
-    real_service.ingest_csv("alice", one_host)
-    assert real_service.list_demo_hosts("alice") == ["attack-host-000"]
-    assert real_service.list_demo_hosts("bob") == []
-    assert db.recent_forecast_log("bob") == []
-    assert len(db.recent_forecast_log("alice")) > 0
-
-    # re-uploading the same host replaces it instead of duplicating windows
-    real_service.ingest_csv("alice", one_host)
-    assert len(real_service.user_df("alice")) == len(one_host)
-    # and it is still there after the in-memory cache is gone (e.g. a server restart)
-    real_service._user_cache.clear()
-    assert len(real_service.user_df("alice")) == len(one_host)
-
-
-def test_backend_rejects_requests_without_a_login(client, monkeypatch):
-    from app import auth
-    monkeypatch.setattr(auth, "DEV_MODE", False)
-    monkeypatch.setattr(auth, "SUPABASE_URL", "https://example.supabase.co")
-    assert client.get("/hosts").status_code == 401
-    assert client.get("/hosts", headers={"Authorization": "Bearer not-a-real-token"}).status_code == 401
-
-
-def test_backend_accepts_a_valid_supabase_token(client, monkeypatch):
-    import jwt
-    from datetime import datetime, timedelta, timezone
-    from app import auth
-    monkeypatch.setattr(auth, "DEV_MODE", False)
-    monkeypatch.setattr(auth, "SUPABASE_URL", "https://example.supabase.co")
-    monkeypatch.setattr(auth, "JWT_SECRET", "test-secret-test-secret-test-secret")
-    token = jwt.encode({"sub": "user-1", "aud": "authenticated",
-                        "exp": datetime.now(timezone.utc) + timedelta(minutes=5)},
-                       "test-secret-test-secret-test-secret", algorithm="HS256")
-    r = client.get("/hosts", headers={"Authorization": f"Bearer {token}"})
-    assert r.status_code == 200 and r.json() == []  # signed in, new account: blank
+def test_threshold_calibration_route_404s_honestly_when_not_yet_computed(client, monkeypatch, tmp_path):
+    """The fixture's fast/tiny service never runs app.evaluate_... calibration
+    (that's train.py's job) -- the route must say so clearly, not crash.
+    Points THRESHOLD_CALIBRATION_JSON at a path that's guaranteed not to
+    exist, regardless of whether a real `python -m app.train` has been run
+    against this checkout's actual data/ directory."""
+    import app.inference.service as service_module
+    monkeypatch.setattr(service_module, "THRESHOLD_CALIBRATION_JSON", tmp_path / "no_such_file.json")
+    r = client.get("/threshold-calibration")
+    assert r.status_code == 404
+    assert "not yet computed" in r.json()["detail"]

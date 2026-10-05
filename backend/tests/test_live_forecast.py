@@ -1,12 +1,10 @@
-"""Live capture windows (from the capture agent or local capture) are saved to
-the user's own hosts as live:<ip>, predicted from the first window, and then
-behave like any other host on every page."""
+from collections import deque
+
 import numpy as np
 import pytest
 import torch
 
-from app import db
-from app.config import FEATURE_COLUMNS, N_FEATURES, SEQ_LEN, STAGE_CLASSES
+from app.config import N_FEATURES, SEQ_LEN, STAGE_CLASSES
 from app.models.lstm_world_model import LSTMWorldModel
 from app.models.baseline_lr import train_baseline
 from app.inference.service import InferenceService
@@ -34,56 +32,89 @@ def _make_service():
 
 
 @pytest.fixture()
-def svc(tmp_path):
-    db.configure(f"sqlite:///{(tmp_path / 'live.sqlite3').as_posix()}")
-    db.init_db()
-    return _make_service()
+def live_capture_with_history(monkeypatch):
+    from app.live.capture import live_capture
+    live_capture.running = True
+    rng = np.random.default_rng(1)
+    live_capture.history = {"10.0.0.9": deque([rng.normal(size=N_FEATURES).astype(np.float32) for _ in range(SEQ_LEN)], maxlen=SEQ_LEN)}
+    live_capture.window_counter = {"10.0.0.9": 12}
+    yield live_capture
+    live_capture.running = False
+    live_capture.history = {}
+    live_capture.window_counter = {}
 
 
-def _features(rng):
-    return {c: float(abs(v)) for c, v in zip(FEATURE_COLUMNS, rng.normal(size=N_FEATURES))}
+def test_forecast_live_host_returns_real_shape(live_capture_with_history):
+    svc = _make_service()
+    result = svc.forecast_live_host("10.0.0.9")
+    assert result["host_id"] == "live:10.0.0.9"
+    assert result["window_idx"] == 12
+    assert 0.0 <= result["infiltration_probability_world_model"] <= 1.0
+    assert len(result["rollout"]["predicted_stage_per_horizon"]) > 0
+    assert len(result["rollout"]["branching_forecast"]) > 0
+    assert result["true_stage"] is None
 
 
-def test_first_window_is_predicted_and_saved_as_a_live_host(svc):
-    entry = svc.ingest_live_window("alice", "10.0.0.9", _features(np.random.default_rng(1)))
-    assert entry["host_id"] == "live:10.0.0.9" and entry["window_idx"] == 0
-    assert entry["warmup"] is True and entry["history_windows_used"] == 1
-    assert entry["predicted_stage"] in STAGE_CLASSES
-    assert 0.0 <= entry["infiltration_probability_world_model"] <= 1.0
-    assert svc.list_demo_hosts("alice") == ["live:10.0.0.9"]
-    assert db.recent_live_entries("alice")[0]["window_idx"] == 0
-    assert db.recent_forecast_log("alice")[0]["host_id"] == "live:10.0.0.9"
+def test_forecast_demo_host_dispatches_to_live_for_live_prefixed_id(live_capture_with_history):
+    svc = _make_service()
+    result = svc.forecast_demo_host("live:10.0.0.9")
+    assert result["host_id"] == "live:10.0.0.9"
 
 
-def test_live_host_works_on_every_page_once_it_has_history(svc):
-    rng = np.random.default_rng(2)
-    for _ in range(SEQ_LEN - 1):
-        svc.ingest_live_window("alice", "10.0.0.9", _features(rng))
-    with pytest.raises(ValueError, match="not enough yet"):
-        svc.forecast_demo_host("alice", "live:10.0.0.9")
-    assert svc.live_hosts_with_predictions("alice") == []
-
-    last = svc.ingest_live_window("alice", "10.0.0.9", _features(rng))
-    assert last["warmup"] is False and last["history_windows_used"] == SEQ_LEN
-    f = svc.forecast_demo_host("alice", "live:10.0.0.9")
-    assert f["host_id"] == "live:10.0.0.9" and len(f["rollout"]["infiltration_probs_world_model"]) > 0
-    assert svc.live_hosts_with_predictions("alice") == ["live:10.0.0.9"]
-    assert len(svc.track_attacker("alice", "live:10.0.0.9")["steps"]) == SEQ_LEN
-    cf = svc.run_counterfactual("alice", "live:10.0.0.9", "isolate_host")
-    assert "metrics" in cf
+def test_forecast_live_host_raises_when_capture_not_running():
+    from app.live.capture import live_capture
+    live_capture.running = False
+    svc = _make_service()
+    with pytest.raises(ValueError, match="not running"):
+        svc.forecast_live_host("10.0.0.9")
 
 
-def test_live_hosts_are_private_to_their_user(svc):
-    svc.ingest_live_window("alice", "10.0.0.9", _features(np.random.default_rng(3)))
-    assert svc.list_demo_hosts("bob") == []
-    assert db.recent_live_entries("bob") == []
-    with pytest.raises(ValueError, match="unknown host_id"):
-        svc.track_attacker("bob", "live:10.0.0.9")
+def test_forecast_live_host_raises_when_not_enough_windows():
+    from app.live.capture import live_capture
+    live_capture.running = True
+    live_capture.history = {"10.0.0.9": deque([np.zeros(N_FEATURES, dtype=np.float32)] * 3, maxlen=SEQ_LEN)}
+    svc = _make_service()
+    try:
+        with pytest.raises(ValueError, match="not enough"):
+            svc.forecast_live_host("10.0.0.9")
+    finally:
+        live_capture.running = False
+        live_capture.history = {}
 
 
-def test_recent_live_entries_are_newest_first(svc):
-    rng = np.random.default_rng(4)
-    svc.ingest_live_window("alice", "10.0.0.9", _features(rng))
-    svc.ingest_live_window("alice", "10.0.0.8", _features(rng))
-    entries = db.recent_live_entries("alice")
-    assert [e["host_id"] for e in entries] == ["live:10.0.0.8", "live:10.0.0.9"]
+def test_at_window_idx_rejected_for_live_hosts(live_capture_with_history):
+    svc = _make_service()
+    with pytest.raises(ValueError, match="at_window_idx"):
+        svc.forecast_demo_host("live:10.0.0.9", at_window_idx=5)
+
+
+def test_run_counterfactual_dispatches_to_live(live_capture_with_history):
+    svc = _make_service()
+    result = svc.run_counterfactual("live:10.0.0.9", "isolate_host")
+    assert result["host_id"] == "live:10.0.0.9"
+    assert result["window_idx"] == 12
+    assert "action_divergences" in result
+
+
+def test_live_hosts_with_predictions_lists_eligible_hosts(live_capture_with_history):
+    svc = _make_service()
+    assert svc.live_hosts_with_predictions() == ["live:10.0.0.9"]
+
+
+def test_live_hosts_with_predictions_excludes_hosts_below_threshold():
+    from app.live.capture import live_capture
+    live_capture.running = True
+    live_capture.history = {"10.0.0.9": deque([np.zeros(N_FEATURES, dtype=np.float32)] * 3, maxlen=SEQ_LEN)}
+    svc = _make_service()
+    try:
+        assert svc.live_hosts_with_predictions() == []
+    finally:
+        live_capture.running = False
+        live_capture.history = {}
+
+
+def test_live_hosts_with_predictions_empty_when_capture_not_running():
+    from app.live.capture import live_capture
+    live_capture.running = False
+    svc = _make_service()
+    assert svc.live_hosts_with_predictions() == []

@@ -53,8 +53,7 @@ def _acc(x):
 # ---------------------------------------------------------------------------
 # 1 + 3: window-level tracking and path recognition
 # ---------------------------------------------------------------------------
-def evaluate_window_tracking(model, scaler, labeled, hosts: set, attack_hosts=None) -> tuple[dict, dict]:
-    is_attack = (lambda h: h in attack_hosts) if attack_hosts is not None else (lambda h: h.startswith("attack-host"))
+def evaluate_window_tracking(model, scaler, labeled, hosts: set) -> tuple[dict, dict]:
     y_true, y_pred, top3, warm, trans = [], [], [], [], []
     path_rows = []
     for h in sorted(hosts):
@@ -68,7 +67,7 @@ def evaluate_window_tracking(model, scaler, labeled, hosts: set, attack_hosts=No
             top3.append(s["correct_top3"])
             warm.append(s["warmup"])
             trans.append(s["is_transition"])
-        if is_attack(h):
+        if h.startswith("attack-host"):
             got = tr["summary"]["attack_path_recognised"]
             real = tr["summary"]["attack_path_actual"]
             path_rows.append({
@@ -114,12 +113,11 @@ def evaluate_window_tracking(model, scaler, labeled, hosts: set, attack_hosts=No
 # ---------------------------------------------------------------------------
 # 2: cold start -- attacker seen for the first time at window 1
 # ---------------------------------------------------------------------------
-def evaluate_cold_start(model, scaler, labeled, hosts: set, attack_hosts=None) -> dict:
-    is_attack = (lambda h: h in attack_hosts) if attack_hosts is not None else (lambda h: h.startswith("attack-host"))
+def evaluate_cold_start(model, scaler, labeled, hosts: set) -> dict:
     correct_by_step = {k: [] for k in range(1, SEQ_LEN)}
     alert_after = []
     for h in sorted(hosts):
-        if not is_attack(h):
+        if not h.startswith("attack-host"):
             continue
         feats, widx, labels = _host_arrays(labeled, scaler, h)
         onset = next(i for i, l in enumerate(labels) if l != "benign")
@@ -191,14 +189,8 @@ def _ranked_from_ngram(ng: NGramMoveModel, hist, first=None, k=3):
     return [best] + [[c["move"]] for c in first_rank if c["move"] != best[0]]
 
 
-def evaluate_multistep(model, scaler, labeled, train_hosts, heldout_hosts, attack_hosts=None,
-                       trained_ngram: NGramMoveModel | None = None, save: bool = True) -> dict:
-    """trained_ngram: evaluate an already-trained move model (e.g. on a user's
-    uploaded traffic) instead of fitting one on train_hosts; save=False never
-    touches the stored model file."""
-    if attack_hosts is None:
-        attack_hosts = sorted(h for h in labeled["host_id"].unique() if h.startswith("attack-host"))
-    attack_hosts = sorted(attack_hosts)
+def evaluate_multistep(model, scaler, labeled, train_hosts, heldout_hosts) -> dict:
+    attack_hosts = sorted(h for h in labeled["host_id"].unique() if h.startswith("attack-host"))
     seqs = {h: labels_to_moves(_host_arrays(labeled, scaler, h)[2], add_end=True) for h in attack_hosts}
 
     # (a) n-gram family, leave-one-attack-host-out over ALL attack hosts (no LSTM involved)
@@ -217,16 +209,11 @@ def evaluate_multistep(model, scaler, labeled, train_hosts, heldout_hosts, attac
 
     # (b) head-to-head on held-out attack hosts (the LSTM never trained on them);
     # n-gram trained on TRAIN attack hosts only -- same split as the LSTM.
-    if trained_ngram is not None:
-        ng_train = trained_ngram
-        markov_train = NGramMoveModel(order=2)  # first-order view of the same trained counts
-        markov_train.counts[1], markov_train.counts[2] = ng_train.counts[1], ng_train.counts[2]
-    else:
-        train_seqs = [seqs[h] for h in attack_hosts if h in train_hosts]
-        ng_train = NGramMoveModel(order=3).fit(train_seqs)
-        markov_train = NGramMoveModel(order=2).fit(train_seqs)
+    train_seqs = [seqs[h] for h in attack_hosts if h in train_hosts]
+    ng_train = NGramMoveModel(order=3).fit(train_seqs)
+    markov_train = NGramMoveModel(order=2).fit(train_seqs)
     h2h: dict[str, list] = {"markov_order1": [], "trigram_order2": [], "lstm_only": [], "hybrid_trigram_plus_lstm": []}
-    for h in sorted(x for x in heldout_hosts if x in attack_hosts):
+    for h in sorted(x for x in heldout_hosts if x.startswith("attack-host")):
         feats, _, labels = _host_arrays(labeled, scaler, h)
         probs, _ = batch_next_step_probs(model, feats)
         for hist, fut, p in _move_eval_points(labels, probs):
@@ -238,8 +225,7 @@ def evaluate_multistep(model, scaler, labeled, train_hosts, heldout_hosts, attac
             hyb = hybrid_next_move_distribution(ng_train, hist, p)
             h2h["hybrid_trigram_plus_lstm"].append((_ranked_from_ngram(ng_train, hist, first=hyb), fut))
 
-    if save:
-        ng_train.save(NGRAM_MODEL_JSON)
+    ng_train.save(NGRAM_MODEL_JSON)
     return {
         "unit": "a MOVE = a distinct attacker action (consecutive identical windows merged, benign dropped, "
                 "<END> = attack finished). One evaluation point per attack window; history = true moves so far.",
@@ -247,7 +233,7 @@ def evaluate_multistep(model, scaler, labeled, train_hosts, heldout_hosts, attac
             name: _score(v) for name, v in loho.items()
         },
         "heldout_hosts_vs_lstm": {
-            "hosts": sorted(x for x in heldout_hosts if x in attack_hosts),
+            "hosts": sorted(x for x in heldout_hosts if x.startswith("attack-host")),
             "note": "lstm_only only predicts the next single move (it is a next-WINDOW model); "
                     "the hybrid uses LSTM evidence for move 1 and trigram grammar for moves 2-3.",
             **{name: _score(v, max_k=1 if name == "lstm_only" else 3) for name, v in h2h.items()},

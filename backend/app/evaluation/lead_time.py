@@ -50,9 +50,8 @@ def _worldmodel_alert_window(model, scaler, host_df: pd.DataFrame, threshold: fl
 
 def compute_lead_time(model, baseline_clf, scaler, labeled_df: pd.DataFrame,
                        train_hosts: set, val_hosts: set, test_hosts: set,
-                       threshold: float = 0.5, attack_hosts=None, write: bool = True) -> dict:
-    if attack_hosts is None:
-        attack_hosts = sorted(h for h in labeled_df["host_id"].unique() if h.startswith("attack-host"))
+                       threshold: float = 0.5) -> dict:
+    attack_hosts = sorted(h for h in labeled_df["host_id"].unique() if h.startswith("attack-host"))
     per_host = []
     lead_times_all, lead_times_heldout = [], []
 
@@ -100,7 +99,6 @@ def compute_lead_time(model, baseline_clf, scaler, labeled_df: pd.DataFrame,
             "baseline_fire_window's own data even exists."
         ),
     }
-    if write:
-        with open(LEAD_TIME_JSON, "w") as f:
-            json.dump(report, f, indent=2)
+    with open(LEAD_TIME_JSON, "w") as f:
+        json.dump(report, f, indent=2)
     return report

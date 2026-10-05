@@ -314,22 +314,17 @@ def one_step_forecast(model: LSTMWorldModel, window: np.ndarray):
 
 
 def input_gradient_saliency(model: LSTMWorldModel, window: np.ndarray) -> np.ndarray:
-    """Per-feature, per-timestep saliency for the infiltration output:
-    gradient of the infiltration LOG-ODDS, log(P(non-benign) / P(benign)),
-    w.r.t. the input window, evaluated at the actual input. Returns a
-    (seq_len, n_features) array. Same sign and ranking meaning as the gradient
-    of 1 - P(benign), but it does not vanish when the model is confident --
-    the probability's gradient is ~0 for every feature once P saturates near
-    0 or 1, which made every contribution read +0.0000. This is a genuine
+    """Per-feature, per-timestep saliency for the infiltration-probability
+    output: gradient of (1 - P(benign)) w.r.t. the input window, evaluated at
+    the actual input. Returns (seq_len, n_features) array. This is a genuine
     gradient computed from the trained model's actual weights on the actual
     input -- not a static or hard-coded importance table."""
     model.eval()
     x = torch.tensor(window, dtype=torch.float32).unsqueeze(0)
     x.requires_grad_(True)
     stage_logits, _, _ = model(x)
-    logits = stage_logits[0]
-    non_benign = torch.cat([logits[:BENIGN_IDX], logits[BENIGN_IDX + 1:]])
-    log_odds = torch.logsumexp(non_benign, dim=0) - logits[BENIGN_IDX]
-    log_odds.backward()
+    probs = F.softmax(stage_logits, dim=1)
+    infiltration = 1.0 - probs[0, BENIGN_IDX]
+    infiltration.backward()
     grad = x.grad.squeeze(0).numpy()  # (seq_len, n_features)
     return grad

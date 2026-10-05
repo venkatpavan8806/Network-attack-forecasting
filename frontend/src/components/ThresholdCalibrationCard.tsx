@@ -17,11 +17,11 @@ export default function ThresholdCalibrationCard() {
     <div className="card p-6">
       <CardHeader
         title="Alert Threshold Calibration"
-        subtitle="What threshold a real alert-per-day budget would actually require, computed from the model's real score distribution on your benign traffic -- not the fixed 0.5 used elsewhere."
+        subtitle="What threshold a real alert-per-day budget would actually require, computed from the model's real score distribution on held-out benign traffic -- not the fixed 0.5 used elsewhere."
       />
       {notComputed && (
         <div className="text-sm text-[var(--color-ink-faint)] py-8 text-center">
-          No labelled traffic yet — upload a CSV containing fully benign hosts with a true_stage column (Forecasts → CSV Ingestion) to see this computed on your data.
+          not yet computed -- run <code className="font-mono">python -m app.train</code>
         </div>
       )}
       {!notComputed && !report && (
@@ -32,7 +32,7 @@ export default function ThresholdCalibrationCard() {
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div className="bg-[var(--color-accent-soft)] rounded-xl p-4">
               <div className="text-[11px] text-[var(--color-ink-dim)] uppercase tracking-wide mb-1">
-                Current fixed threshold (0.5), on your benign traffic
+                Current fixed threshold (0.5), on held-out benign traffic
               </div>
               <div className="text-lg font-bold text-[var(--color-ink)]">
                 {pct(report.current_fixed_threshold.false_positive_rate_on_held_out_benign)} false-positive rate
@@ -45,7 +45,7 @@ export default function ThresholdCalibrationCard() {
             <div className="bg-[var(--color-card)] border border-[var(--color-accent-soft)] rounded-xl p-4">
               <div className="text-[11px] text-[var(--color-ink-dim)] uppercase tracking-wide mb-1">Sample size</div>
               <div className="text-lg font-bold text-[var(--color-ink)]">{report.n_benign_windows.toLocaleString()}</div>
-              <div className="text-xs text-[var(--color-ink-dim)] mt-1">benign windows from your uploads, {report.window_seconds}s each</div>
+              <div className="text-xs text-[var(--color-ink-dim)] mt-1">held-out pure-benign windows, {report.window_seconds}s each</div>
             </div>
           </div>
 
